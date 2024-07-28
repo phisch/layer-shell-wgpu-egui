@@ -1,0 +1,16 @@
+[package]
+name = "gui"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+wayland-client = "0.31.5"
+wayland-backend = { version = "0.3.6", features = ["client_system"] }
+smithay-client-toolkit = "0.19.2"
+egui = "0.28.1"
+egui_glow = "0.28.1"
+glutin = "0.32.0"
+env_logger = "0.11.5"
+raw-window-handle = "0.6.2"
