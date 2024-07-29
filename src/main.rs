@@ -1,5 +1,6 @@
 use std::{ffi::CString, num::NonZeroU32, ptr::NonNull, sync::Arc};
 
+use egui::RawInput;
 use glutin::{
     api::egl::{
         context::{NotCurrentContext, PossiblyCurrentContext},
@@ -69,6 +70,7 @@ fn main() {
         surface: None,
         current_context: None,
         egui_glow: None,
+        name: "Simple Layer".to_string(),
     };
 
     let surface = simple_layer.compositor_state.create_surface(&qh);
@@ -126,6 +128,7 @@ fn main() {
 struct EguiGlow {
     pub egui_ctx: egui::Context,
     pub painter: egui_glow::Painter,
+    pub egui_input: RawInput,
 
     shapes: Vec<egui::epaint::ClippedShape>,
     textures_delta: egui::TexturesDelta,
@@ -137,6 +140,7 @@ impl EguiGlow {
 
         Self {
             egui_ctx: Default::default(),
+            egui_input: Default::default(),
             painter,
             shapes: Default::default(),
             textures_delta: Default::default(),
@@ -151,18 +155,7 @@ impl EguiGlow {
             pixels_per_point: _pixels_per_point,
             viewport_output: _viewport_output,
         } = self.egui_ctx.run(
-            egui::RawInput {
-                screen_rect: Some({
-                    egui::Rect {
-                        min: egui::Pos2 { x: 0f32, y: 0f32 },
-                        max: egui::Pos2 {
-                            x: size.0 as f32,
-                            y: size.1 as f32,
-                        },
-                    }
-                }),
-                ..Default::default()
-            },
+            self.egui_input.clone(),
             run_ui,
         );
         self.shapes = shapes;
@@ -215,6 +208,7 @@ struct SimpleLayer {
     surface: Option<Surface<WindowSurface>>,
     current_context: Option<PossiblyCurrentContext>,
     egui_glow: Option<EguiGlow>,
+    name: String,
 }
 
 impl CompositorHandler for SimpleLayer {
@@ -470,43 +464,42 @@ impl PointerHandler for SimpleLayer {
             }
             match event.kind {
                 Enter { .. } => {
-                    println!("Pointer entered @{:?}", event.position);
+                    egui_context.input_mut(|input_state| {
+                        input_state.events.push(egui::Event::WindowFocused(true))
+                    });
+
+
+                    //println!("Pointer entered @{:?}", event.position);
                 }
                 Leave { .. } => {
-                    println!("Pointer left");
+                    egui_context.input_mut(|input_state| {
+                        input_state.events.push(egui::Event::WindowFocused(false))
+                    });
                 }
                 Motion { .. } => {
                     println!("Pointer moved to {:?}", event.position);
-                    egui_context.input_mut(|input_state| {
-                        input_state
-                            .events
-                            .push(egui::Event::PointerMoved(egui::pos2(
-                                event.position.0 as f32,
-                                event.position.1 as f32,
-                            )))
-                    });
+
+                    egui_glow.egui_input.events.push(egui::Event::PointerMoved(egui::pos2(
+                        event.position.0 as f32,
+                        event.position.1 as f32,
+                    )));
                 }
-                Press { button, .. } => {
-                    println!("Press {:x} @ {:?}", button, event.position);
-                    egui_context.input_mut(|input_state| {
-                        input_state.events.push(egui::Event::PointerButton {
-                            button: egui::PointerButton::Primary,
-                            modifiers: Default::default(),
-                            pos: egui::pos2(event.position.0 as f32, event.position.1 as f32),
-                            pressed: true,
-                        })
+                Press { .. } => {
+
+                    egui_glow.egui_input.events.push(egui::Event::PointerButton {
+                        button: egui::PointerButton::Primary,
+                        modifiers: Default::default(),
+                        pos: egui::pos2(event.position.0 as f32, event.position.1 as f32),
+                        pressed: true,
                     });
+
                     self.shift = self.shift.xor(Some(0));
                 }
-                Release { button, .. } => {
-                    println!("Release {:x} @ {:?}", button, event.position);
+                Release { .. } => {
+                    //println!("Release {:x} @ {:?}", button, event.position);
                 }
-                Axis {
-                    horizontal,
-                    vertical,
-                    ..
-                } => {
-                    println!("Scroll H:{:?}, V:{:?}", horizontal, vertical);
+                Axis { .. } => {
+                    //println!("Scroll H:{:?}, V:{:?}", horizontal, vertical);
                 }
             }
         }
@@ -543,6 +536,11 @@ impl SimpleLayer {
                             egui::widget_text::RichText::new("Main text")
                                 .color(egui::Color32::WHITE),
                         );
+                    });
+                    ui.horizontal(|ui| {
+                        let name_label = ui.label("Your name: ");
+                        ui.text_edit_singleline(&mut self.name)
+                            .labelled_by(name_label.id);
                     });
                     ui.add(
                         egui::widgets::ProgressBar::new(0.5)
