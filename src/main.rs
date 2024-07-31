@@ -1,6 +1,6 @@
 use std::{ffi::CString, num::NonZeroU32, ptr::NonNull, sync::Arc};
 
-use egui::RawInput;
+use egui::{PointerButton, RawInput, ViewportId};
 use glutin::{
     api::egl::{
         context::{NotCurrentContext, PossiblyCurrentContext},
@@ -11,11 +11,16 @@ use glutin::{
     prelude::{GlDisplay, NotCurrentGlContext},
     surface::{GlSurface, WindowSurface},
 };
+use gui::keys::handle_key_press;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
     delegate_registry, delegate_seat,
     output::{OutputHandler, OutputState},
+    reexports::{
+        calloop::{EventLoop, LoopHandle},
+        calloop_wayland_source::WaylandSource,
+    },
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
@@ -25,7 +30,8 @@ use smithay_client_toolkit::{
     },
     shell::{
         wlr_layer::{
-            Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure
+            Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
+            LayerSurfaceConfigure,
         },
         WaylandSurface,
     },
@@ -44,8 +50,15 @@ fn main() {
 
     let conn = Connection::connect_to_env().unwrap();
 
-    let (globals, mut event_queue) = registry_queue_init(&conn).unwrap();
+    let (globals, event_queue) = registry_queue_init(&conn).unwrap();
     let qh = event_queue.handle();
+
+    let mut event_loop: EventLoop<SimpleLayer> =
+        EventLoop::try_new().expect("Could not create event loop.");
+    let loop_handle = event_loop.handle();
+    WaylandSource::new(conn.clone(), event_queue)
+        .insert(loop_handle)
+        .unwrap();
 
     let mut simple_layer = SimpleLayer {
         registry_state: RegistryState::new(&globals),
@@ -59,10 +72,10 @@ fn main() {
         first_configure: true,
         width: 600,
         height: 400,
-        shift: None,
+        _shift: None,
         layer: None,
         keyboard: None,
-        keyboard_focus: false,
+        _keyboard_focus: false,
         pointer: None,
 
         gl: None,
@@ -71,6 +84,7 @@ fn main() {
         current_context: None,
         egui_glow: None,
         name: "Simple Layer".to_string(),
+        loop_handle: event_loop.handle(),
     };
 
     let surface = simple_layer.compositor_state.create_surface(&qh);
@@ -116,7 +130,7 @@ fn main() {
     // We don't draw immediately, the configure will notify us when to first draw.
 
     loop {
-        event_queue.blocking_dispatch(&mut simple_layer).unwrap();
+        event_loop.dispatch(None, &mut simple_layer).unwrap();
 
         if simple_layer.exit {
             println!("exiting example");
@@ -132,34 +146,38 @@ struct EguiGlow {
 
     shapes: Vec<egui::epaint::ClippedShape>,
     textures_delta: egui::TexturesDelta,
+    start_time: std::time::Instant,
 }
 
 impl EguiGlow {
     fn new(gl: std::sync::Arc<egui_glow::glow::Context>) -> Self {
         let painter = egui_glow::Painter::new(gl, "", None).expect("failed to create painter");
 
+        let mut input = egui::RawInput {
+            focused: true,
+            ..Default::default()
+        };
+
+        input.viewports.entry(ViewportId::ROOT).or_default();
+
         Self {
             egui_ctx: Default::default(),
-            egui_input: Default::default(),
+            egui_input: input,
             painter,
             shapes: Default::default(),
             textures_delta: Default::default(),
+            start_time: std::time::Instant::now(),
         }
     }
 
-    fn run(&mut self, size: (u32, u32), run_ui: impl FnMut(&egui::Context)) {
-        let egui::FullOutput {
-            platform_output: _platform_output,
-            textures_delta,
-            shapes,
-            pixels_per_point: _pixels_per_point,
-            viewport_output: _viewport_output,
-        } = self.egui_ctx.run(
-            self.egui_input.clone(),
-            run_ui,
-        );
-        self.shapes = shapes;
-        self.textures_delta.append(textures_delta);
+    fn run(&mut self, _size: (u32, u32), run_ui: impl FnMut(&egui::Context)) {
+        self.egui_input.time = Some(self.start_time.elapsed().as_secs_f64());
+        self.egui_input.viewport_id = ViewportId::ROOT;
+
+        let output = self.egui_ctx.run(self.egui_input.take(), run_ui);
+
+        self.shapes = output.shapes;
+        self.textures_delta.append(output.textures_delta);
     }
 
     fn paint(&mut self, size: (u32, u32)) {
@@ -197,10 +215,10 @@ struct SimpleLayer {
     first_configure: bool,
     width: u32,
     height: u32,
-    shift: Option<u32>,
+    _shift: Option<u32>,
     layer: Option<LayerSurface>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
-    keyboard_focus: bool,
+    _keyboard_focus: bool,
     pointer: Option<wl_pointer::WlPointer>,
 
     gl: Option<Arc<egui_glow::glow::Context>>,
@@ -209,6 +227,7 @@ struct SimpleLayer {
     current_context: Option<PossiblyCurrentContext>,
     egui_glow: Option<EguiGlow>,
     name: String,
+    loop_handle: LoopHandle<'static, SimpleLayer>,
 }
 
 impl CompositorHandler for SimpleLayer {
@@ -249,7 +268,13 @@ impl CompositorHandler for SimpleLayer {
         _surface: &wl_surface::WlSurface,
         _output: &wl_output::WlOutput,
     ) {
-        // not needed
+        // send focus event on input
+        let egui_glow = self.egui_glow.as_mut().unwrap();
+        egui_glow.egui_input.focused = true;
+        egui_glow
+            .egui_input
+            .events
+            .push(egui::Event::WindowFocused(true));
     }
 
     fn surface_leave(
@@ -259,7 +284,13 @@ impl CompositorHandler for SimpleLayer {
         _surface: &wl_surface::WlSurface,
         _output: &wl_output::WlOutput,
     ) {
-        // not needed
+        // send focus event on input
+        let egui_glow = self.egui_glow.as_mut().unwrap();
+        egui_glow.egui_input.focused = false;
+        egui_glow
+            .egui_input
+            .events
+            .push(egui::Event::WindowFocused(false));
     }
 }
 
@@ -342,7 +373,20 @@ impl SeatHandler for SimpleLayer {
             println!("Set keyboard capability");
             let keyboard = self
                 .seat_state
-                .get_keyboard(qh, &seat, None)
+                .get_keyboard_with_repeat(
+                    qh,
+                    &seat,
+                    None,
+                    self.loop_handle.clone(),
+                    Box::new(|state, _wl_kbd, event| {
+                        
+                        handle_key_press(
+                            event,
+                            true,
+                            &mut state.egui_glow.as_mut().unwrap().egui_input,
+                        );
+                    }),
+                )
                 .expect("Failed to create keyboard");
             self.keyboard = Some(keyboard);
         }
@@ -384,15 +428,17 @@ impl KeyboardHandler for SimpleLayer {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
-        surface: &wl_surface::WlSurface,
+        _: &wl_surface::WlSurface,
         _: u32,
         _: &[u32],
-        keysyms: &[Keysym],
+        _: &[Keysym],
     ) {
-        if self.layer.as_ref().map(LayerSurface::wl_surface) == Some(surface) {
-            println!("Keyboard focus on window with pressed syms: {:?}", keysyms);
-            self.keyboard_focus = true;
-        }
+        let egui_glow = self.egui_glow.as_mut().unwrap();
+        egui_glow.egui_input.focused = true;
+        egui_glow
+            .egui_input
+            .events
+            .push(egui::Event::WindowFocused(true));
     }
 
     fn leave(
@@ -400,13 +446,15 @@ impl KeyboardHandler for SimpleLayer {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
-        surface: &wl_surface::WlSurface,
+        _: &wl_surface::WlSurface,
         _: u32,
     ) {
-        if self.layer.as_ref().map(LayerSurface::wl_surface) == Some(surface) {
-            println!("Release keyboard focus on window");
-            self.keyboard_focus = false;
-        }
+        let egui_glow = self.egui_glow.as_mut().unwrap();
+        egui_glow.egui_input.focused = false;
+        egui_glow
+            .egui_input
+            .events
+            .push(egui::Event::WindowFocused(false));
     }
 
     fn press_key(
@@ -417,7 +465,11 @@ impl KeyboardHandler for SimpleLayer {
         _: u32,
         event: KeyEvent,
     ) {
-        println!("Key press: {:?}", event);
+        handle_key_press(
+            event,
+            true,
+            &mut self.egui_glow.as_mut().unwrap().egui_input,
+        );
     }
 
     fn release_key(
@@ -428,7 +480,11 @@ impl KeyboardHandler for SimpleLayer {
         _: u32,
         event: KeyEvent,
     ) {
-        println!("Key release: {:?}", event);
+        handle_key_press(
+            event,
+            false,
+            &mut self.egui_glow.as_mut().unwrap().egui_input,
+        );
     }
 
     fn update_modifiers(
@@ -440,68 +496,92 @@ impl KeyboardHandler for SimpleLayer {
         modifiers: Modifiers,
         _layout: u32,
     ) {
-        println!("Update modifiers: {:?}", modifiers);
+        let egui_glow = self.egui_glow.as_mut().unwrap();
+        egui_glow.egui_input.modifiers = egui::Modifiers {
+            alt: modifiers.alt,
+            ctrl: modifiers.ctrl,
+            shift: modifiers.shift,
+            mac_cmd: false,
+            command: modifiers.ctrl,
+        };
+    }
+
+    fn update_repeat_info(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _info: smithay_client_toolkit::seat::keyboard::RepeatInfo,
+    ) {
+        dbg!(_info);
+    }
+}
+
+fn translate_button(button: u32) -> Option<PointerButton> {
+    match button {
+        0x110 => Some(PointerButton::Primary),
+        0x111 => Some(PointerButton::Secondary),
+        0x112 => Some(PointerButton::Middle),
+        0x113 => Some(PointerButton::Extra1),
+        0x114 => Some(PointerButton::Extra2),
+        _ => None,
     }
 }
 
 impl PointerHandler for SimpleLayer {
     fn pointer_frame(
         &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _pointer: &wl_pointer::WlPointer,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
         use PointerEventKind::*;
 
         let egui_glow = self.egui_glow.as_mut().unwrap();
 
-        let egui_context = &mut egui_glow.egui_ctx;
-
         for event in events {
-            if Some(&event.surface) != self.layer.as_ref().map(LayerSurface::wl_surface) {
-                continue;
-            }
-            match event.kind {
-                Enter { .. } => {
-                    egui_context.input_mut(|input_state| {
-                        input_state.events.push(egui::Event::WindowFocused(true))
-                    });
+            let egui_event = match event.kind {
+                Press { button, .. } => {
+                    if let Some(button) = translate_button(button) {
+                        egui::Event::PointerButton {
+                            button,
+                            modifiers: egui_glow.egui_input.modifiers,
+                            pos: egui::pos2(event.position.0 as f32, event.position.1 as f32),
+                            pressed: true,
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                Release { button, .. } => {
+                    println!("Release {:x} @ {:?}", button, event.position);
+                    if let Some(button) = translate_button(button) {
+                        egui::Event::PointerButton {
+                            button,
+                            modifiers: egui_glow.egui_input.modifiers,
+                            pos: egui::pos2(event.position.0 as f32, event.position.1 as f32),
+                            pressed: false,
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                Enter { .. } => egui::Event::PointerMoved(egui::pos2(
+                    event.position.0 as f32,
+                    event.position.1 as f32,
+                )),
+                Motion { .. } => egui::Event::PointerMoved(egui::pos2(
+                    event.position.0 as f32,
+                    event.position.1 as f32,
+                )),
+                Leave { .. } => egui::Event::PointerGone,
+                _ => {
+                    continue;
+                }
+            };
 
-
-                    //println!("Pointer entered @{:?}", event.position);
-                }
-                Leave { .. } => {
-                    egui_context.input_mut(|input_state| {
-                        input_state.events.push(egui::Event::WindowFocused(false))
-                    });
-                }
-                Motion { .. } => {
-                    println!("Pointer moved to {:?}", event.position);
-
-                    egui_glow.egui_input.events.push(egui::Event::PointerMoved(egui::pos2(
-                        event.position.0 as f32,
-                        event.position.1 as f32,
-                    )));
-                }
-                Press { .. } => {
-
-                    egui_glow.egui_input.events.push(egui::Event::PointerButton {
-                        button: egui::PointerButton::Primary,
-                        modifiers: Default::default(),
-                        pos: egui::pos2(event.position.0 as f32, event.position.1 as f32),
-                        pressed: true,
-                    });
-
-                    self.shift = self.shift.xor(Some(0));
-                }
-                Release { .. } => {
-                    //println!("Release {:x} @ {:?}", button, event.position);
-                }
-                Axis { .. } => {
-                    //println!("Scroll H:{:?}, V:{:?}", horizontal, vertical);
-                }
-            }
+            egui_glow.egui_input.events.push(egui_event);
         }
     }
 }
@@ -516,56 +596,17 @@ impl SimpleLayer {
         let egui_glow = self.egui_glow.as_mut().unwrap();
 
         let _repaint_after = egui_glow.run((self.width, self.height), |egui_ctx| {
-            let my_frame = egui::containers::Frame {
-                fill: egui::Color32::DARK_GRAY,
-                inner_margin: egui::Margin {
-                    left: 10f32,
-                    right: 10f32,
-                    top: 10f32,
-                    bottom: 10f32,
-                },
-                rounding: egui::Rounding::same(10f32),
-                ..Default::default()
-            };
-
-            egui::CentralPanel::default()
-                .frame(my_frame)
-                .show(egui_ctx, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.label(
-                            egui::widget_text::RichText::new("Main text")
-                                .color(egui::Color32::WHITE),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        let name_label = ui.label("Your name: ");
-                        ui.text_edit_singleline(&mut self.name)
-                            .labelled_by(name_label.id);
-                    });
-                    ui.add(
-                        egui::widgets::ProgressBar::new(0.5)
-                            .show_percentage()
-                            .animate(true)
-                            .text("Text here?"),
-                    );
-                    ui.add(egui::widgets::Button::new("Click me"));
-                    ui.columns(3, |columns| {
-                        columns[0].label(
-                            egui::widget_text::RichText::new("Some status")
-                                .color(egui::Color32::WHITE),
-                        );
-                        columns[2].with_layout(
-                            egui::Layout::right_to_left(egui::Align::Min),
-                            |ui| {
-                                ui.label(
-                                    egui::widget_text::RichText::new("0%")
-                                        .color(egui::Color32::WHITE),
-                                );
-                            },
-                        );
-                    });
-                    egui::warn_if_debug_build(ui);
+            egui::CentralPanel::default().show(egui_ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let name_label = ui.label("Your name: ");
+                    ui.text_edit_singleline(&mut self.name)
+                        .labelled_by(name_label.id);
                 });
+                if ui.button("click me").clicked() {
+                    println!("Button clicked!");
+                }
+                ui.label(format!("Hello '{}'", self.name));
+            });
         });
 
         egui_glow::painter::clear(
