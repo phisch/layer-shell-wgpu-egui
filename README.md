@@ -1,6 +1,6 @@
-# sctk backend for egui
+# Wayland layer_shell backend for egui with WGPU renderer
 
-This is a **very early** and **work in progress** repository working on a smithay client toolkit backend for egui. This will allow for egui applications to run inside a layer_shell surface.
+This is a **very early** and **work in progress** repository working on a wayland layer_shell backend for egui utilizing smithay client toolkit and WGPU.
 
 > [!WARNING]
 > Do not use this, it is somewhat working, but far from finished.
