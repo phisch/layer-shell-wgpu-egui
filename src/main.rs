@@ -1,31 +1,39 @@
-use std::{ffi::CString, num::NonZeroU32, ptr::NonNull, sync::Arc};
+//mod egui_renderer;
+mod egui_state;
+mod keys;
 
-use egui::{PointerButton, RawInput, ViewportId};
-use glutin::{
-    api::egl::{
-        context::{NotCurrentContext, PossiblyCurrentContext},
-        surface::Surface,
+use egui::{PointerButton, Shadow, TextBuffer};
+//use egui_renderer::EguiRenderer;
+use egui_wgpu::{
+    wgpu::{
+        hal::auxil::db, Adapter, Backends, Device, Instance, InstanceDescriptor, PresentMode, Queue, RequestAdapterOptions, Surface, SurfaceConfiguration, SurfaceTargetUnsafe, TextureFormat, TextureUsages
     },
-    config::ConfigSurfaceTypes,
-    display::GetGlDisplay,
-    prelude::{GlDisplay, NotCurrentGlContext},
-    surface::{GlSurface, WindowSurface},
+    ScreenDescriptor,
 };
-use gui::keys::handle_key_press;
+use raw_window_handle::{
+    RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
+};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
-    delegate_registry, delegate_seat,
+    delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
+    delegate_seat,
     output::{OutputHandler, OutputState},
     reexports::{
-        calloop::{EventLoop, LoopHandle},
+        calloop::{
+            ping::make_ping,
+            timer::{TimeoutAction, Timer},
+            EventLoop, LoopHandle,
+        },
         calloop_wayland_source::WaylandSource,
     },
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
-        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers},
-        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        pointer::{
+            PointerEvent,
+            PointerEventKind::{self, Enter, Leave},
+            PointerHandler,
+        },
         Capability, SeatHandler, SeatState,
     },
     shell::{
@@ -36,201 +44,409 @@ use smithay_client_toolkit::{
         WaylandSurface,
     },
 };
+use std::{
+    borrow::Borrow, cell::RefCell, ptr::NonNull, sync::{atomic::AtomicBool, Arc, Mutex}, time::{Duration, Instant}
+};
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{
-        wl_keyboard, wl_output, wl_pointer, wl_seat,
-        wl_surface::{self},
-    },
+    protocol::{wl_output, wl_pointer, wl_seat, wl_surface},
     Connection, Proxy, QueueHandle,
 };
+
+#[derive(Debug)]
+enum Redraw {
+    Unknown,
+    Immediately,
+    Delayed(Instant),
+}
 
 fn main() {
     env_logger::init();
 
+    let initial_width = 600;
+    let initial_height = 300;
+
     let conn = Connection::connect_to_env().unwrap();
+    let (globals, mut event_queue) = registry_queue_init(&conn).unwrap();
+    let qh: Arc<QueueHandle<WgpuEguiLayer>> = Arc::new(event_queue.handle());
 
-    let (globals, event_queue) = registry_queue_init(&conn).unwrap();
-    let qh = event_queue.handle();
-
-    let mut event_loop: EventLoop<SimpleLayer> =
+    let mut event_loop: EventLoop<WgpuEguiLayer> =
         EventLoop::try_new().expect("Could not create event loop.");
+
     let loop_handle = event_loop.handle();
     WaylandSource::new(conn.clone(), event_queue)
         .insert(loop_handle)
         .unwrap();
 
-    let mut simple_layer = SimpleLayer {
+    // Setup the user proxy.
+    let (ping, ping_source) = make_ping().unwrap();
+    let foo_handle = qh.clone();
+    let result = event_loop
+        .handle()
+        .insert_source(ping_source, move |_, _, state: &mut WgpuEguiLayer| {
+            state.needs_redraw = true;
+        })
+        .map_err(|error| error.error);
+
+    let ping_proxy = Arc::new(Mutex::new(ping));
+
+    // Initialize xdg_shell handlers so we can select the correct adapter
+    let compositor_state =
+        CompositorState::bind(&globals, &qh).expect("wl_compositor not available");
+
+    let surface = compositor_state.create_surface(&qh);
+
+    let layer_state = LayerShell::bind(&globals, &qh).expect("layer shell not available");
+    let layer =
+        layer_state.create_layer_surface(&qh, surface, Layer::Top, Some("wgpu_egui_layer"), None);
+    layer.set_anchor(Anchor::TOP);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+    layer.set_size(initial_width, initial_height);
+    layer.commit();
+
+    // Initialize wgpu
+    let instance = Instance::new(InstanceDescriptor {
+        backends: Backends::all(),
+        ..Default::default()
+    });
+
+    // Create the raw window handle for the surface.
+    let raw_display_handle = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
+        NonNull::new(conn.backend().display_ptr() as *mut _).unwrap(),
+    ));
+    let raw_window_handle = RawWindowHandle::Wayland(WaylandWindowHandle::new(
+        NonNull::new(layer.wl_surface().id().as_ptr() as *mut _).unwrap(),
+    ));
+
+    let surface = unsafe {
+        instance
+            .create_surface_unsafe(SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle,
+                raw_window_handle,
+            })
+            .unwrap()
+    };
+
+    // Pick a supported adapter
+    let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+        compatible_surface: Some(&surface),
+        ..Default::default()
+    }))
+    .expect("Failed to find suitable adapter");
+
+    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None))
+        .expect("Failed to request device");
+
+    let swapchain_capabilities = surface.get_capabilities(&adapter);
+    let selected_format = TextureFormat::Bgra8UnormSrgb;
+    let swapchain_format = swapchain_capabilities
+        .formats
+        .iter()
+        .find(|d| **d == selected_format)
+        .expect("failed to select proper surface texture format!");
+
+    let config = SurfaceConfiguration {
+        usage: TextureUsages::RENDER_ATTACHMENT,
+        format: *swapchain_format,
+        width: 600,
+        height: 300,
+        present_mode: PresentMode::Mailbox,
+        desired_maximum_frame_latency: 2,
+        alpha_mode: egui_wgpu::wgpu::CompositeAlphaMode::PreMultiplied,
+        view_formats: vec![*swapchain_format],
+    };
+
+    surface.configure(&device, &config);
+
+    let egui_context = egui::Context::default();
+
+    let planned_redraw = Arc::new(Mutex::new(Redraw::Immediately));
+    let planned_redraw_clone = planned_redraw.clone();
+    
+    
+    egui_context.set_request_repaint_callback(move |info| {
+        let mut redraw = planned_redraw_clone.lock().unwrap();
+        if info.delay == Duration::ZERO {
+            *redraw = Redraw::Immediately;
+        } else {
+            *redraw = Redraw::Delayed(Instant::now() + info.delay);
+        }
+        ping_proxy.lock().unwrap().ping();
+    });
+
+
+    let egui_state = egui_state::State::new(
+        egui_context,
+        egui::viewport::ViewportId::ROOT,
+        &device,
+        config.format,
+        None,
+        1,
+    );
+
+    //let egui_renderer = EguiRenderer::new(&device, config.format, None, 1);
+
+    let mut wgpu = WgpuEguiLayer {
         registry_state: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
         output_state: OutputState::new(&globals, &qh),
-        compositor_state: CompositorState::bind(&globals, &qh)
-            .expect("wl_compositor is not available"),
-        layer_state: LayerShell::bind(&globals, &qh).expect("layer shell is not available"),
 
         exit: false,
-        first_configure: true,
-        width: 600,
-        height: 400,
-        _shift: None,
-        layer: None,
-        keyboard: None,
-        _keyboard_focus: false,
-        pointer: None,
-
-        gl: None,
-        //gl_window: None,
-        surface: None,
-        current_context: None,
-        egui_glow: None,
-        name: "Simple Layer".to_string(),
-        loop_handle: event_loop.handle(),
-    };
-
-    let surface = simple_layer.compositor_state.create_surface(&qh);
-
-    let layer = simple_layer.layer_state.create_layer_surface(
-        &qh,
+        width: initial_width,
+        height: initial_height,
+        layer,
+        device,
         surface,
-        Layer::Top,
-        Some("simple_layer"),
-        None,
-    );
+        adapter,
+        queue,
 
-    layer.set_anchor(Anchor::TOP);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
-    layer.set_size(simple_layer.width, simple_layer.height);
-    layer.set_margin(10, 10, 10, 10);
+        egui_state,
+        //egui_renderer,
+        wgpu_config: config,
 
-    layer.commit();
+        first_configure: true,
+        loop_handle: event_loop.handle(),
 
-    let (not_current_context, surface) =
-        init_egl(layer.wl_surface(), simple_layer.width, simple_layer.height);
+        pointer: None,
+        needs_redraw: true,
+        name: "foo".to_string(),
 
-    let current_context = not_current_context.make_current(&surface).unwrap();
-
-    let gl = unsafe {
-        egui_glow::glow::Context::from_loader_function(|s| {
-            current_context
-                .display()
-                .get_proc_address(CString::new(s).unwrap().as_c_str())
-        })
+        can_draw: false,
+        planned_redraw,
+        has_events: true
     };
 
-    let gl = std::sync::Arc::new(gl);
-    let egui_glow = EguiGlow::new(gl.clone());
 
-    simple_layer.gl = Some(gl);
-    //simple_layer.gl_window = Some(gl_window);
-    simple_layer.surface = Some(surface);
-    simple_layer.current_context = Some(current_context);
-    simple_layer.egui_glow = Some(egui_glow);
-    simple_layer.layer = Some(layer);
+    /* let planned_redraw = wgpu.planned_redraw.clone();
+    wgpu.egui_state.context().set_request_repaint_callback(move |info| {
+        dbg!(&info.delay);
+        if info.delay == Duration::ZERO {
+            return;
+        }
+        let instant = Instant::now() + info.delay as Duration;
+        dbg!("PLANNED REDRAW!");
+        let mut planned_redraw = planned_redraw.lock().unwrap();
+        *planned_redraw = Some(instant);
+    }); */
+
 
     // We don't draw immediately, the configure will notify us when to first draw.
-
     loop {
-        event_loop.dispatch(None, &mut simple_layer).unwrap();
+        let timeout;
 
-        if simple_layer.exit {
+        {
+            let foo = wgpu.planned_redraw.lock().unwrap();
+            timeout = match *foo {
+                Redraw::Immediately => None,
+                Redraw::Delayed(instant) => Some(instant - Instant::now()),
+                Redraw::Unknown => None
+            };
+        }
+        //dbg!(timeout);
+        event_loop.dispatch(timeout, &mut wgpu).unwrap();
+        //event_queue.blocking_dispatch(&mut wgpu).unwrap();
+
+        //dbg!(&wgpu.planned_redraw.lock().unwrap());
+
+        if wgpu.should_draw() {
+            wgpu.draw(&qh);
+        }
+
+
+        if wgpu.exit {
             println!("exiting example");
             break;
         }
     }
+
+    // On exit we must destroy the surface before the window is destroyed.
+    drop(wgpu.surface);
+    drop(wgpu.layer);
 }
 
-struct EguiGlow {
-    pub egui_ctx: egui::Context,
-    pub painter: egui_glow::Painter,
-    pub egui_input: RawInput,
-
-    shapes: Vec<egui::epaint::ClippedShape>,
-    textures_delta: egui::TexturesDelta,
-    start_time: std::time::Instant,
-}
-
-impl EguiGlow {
-    fn new(gl: std::sync::Arc<egui_glow::glow::Context>) -> Self {
-        let painter = egui_glow::Painter::new(gl, "", None).expect("failed to create painter");
-
-        let mut input = egui::RawInput {
-            focused: true,
-            ..Default::default()
-        };
-
-        input.viewports.entry(ViewportId::ROOT).or_default();
-
-        Self {
-            egui_ctx: Default::default(),
-            egui_input: input,
-            painter,
-            shapes: Default::default(),
-            textures_delta: Default::default(),
-            start_time: std::time::Instant::now(),
-        }
-    }
-
-    fn run(&mut self, _size: (u32, u32), run_ui: impl FnMut(&egui::Context)) {
-        self.egui_input.time = Some(self.start_time.elapsed().as_secs_f64());
-        self.egui_input.viewport_id = ViewportId::ROOT;
-
-        let output = self.egui_ctx.run(self.egui_input.take(), run_ui);
-
-        self.shapes = output.shapes;
-        self.textures_delta.append(output.textures_delta);
-    }
-
-    fn paint(&mut self, size: (u32, u32)) {
-        let shapes = std::mem::take(&mut self.shapes);
-        let mut textures_delta = std::mem::take(&mut self.textures_delta);
-
-        for (id, image_delta) in textures_delta.set {
-            self.painter.set_texture(id, &image_delta);
-        }
-
-        let clipped_primitives = self
-            .egui_ctx
-            .tessellate(shapes, self.egui_ctx.pixels_per_point());
-        let dimensions: [u32; 2] = [size.0, size.1];
-        self.painter.paint_primitives(
-            dimensions,
-            self.egui_ctx.pixels_per_point(),
-            &clipped_primitives,
-        );
-
-        for id in textures_delta.free.drain(..) {
-            self.painter.free_texture(id);
-        }
-    }
-}
-
-struct SimpleLayer {
+struct WgpuEguiLayer {
     registry_state: RegistryState,
     seat_state: SeatState,
     output_state: OutputState,
-    compositor_state: CompositorState,
-    layer_state: LayerShell,
 
     exit: bool,
-    first_configure: bool,
     width: u32,
     height: u32,
-    _shift: Option<u32>,
-    layer: Option<LayerSurface>,
-    keyboard: Option<wl_keyboard::WlKeyboard>,
-    _keyboard_focus: bool,
-    pointer: Option<wl_pointer::WlPointer>,
+    layer: LayerSurface,
 
-    gl: Option<Arc<egui_glow::glow::Context>>,
-    //gl_window: Option<glutin::RawContext<glutin::PossiblyCurrent>>,
-    surface: Option<Surface<WindowSurface>>,
-    current_context: Option<PossiblyCurrentContext>,
-    egui_glow: Option<EguiGlow>,
+    adapter: Adapter,
+    device: Device,
+    queue: Queue,
+    surface: Surface<'static>,
+
+    egui_state: egui_state::State,
+    //egui_renderer: EguiRenderer,
+    wgpu_config: egui_wgpu::wgpu::SurfaceConfiguration,
+
+    first_configure: bool,
+
+    loop_handle: LoopHandle<'static, WgpuEguiLayer>,
+
+    pointer: Option<wl_pointer::WlPointer>,
+    needs_redraw: bool,
+
     name: String,
-    loop_handle: LoopHandle<'static, SimpleLayer>,
+
+
+    can_draw: bool,
+    planned_redraw: Arc<Mutex<Redraw>>,
+    has_events: bool
 }
 
-impl CompositorHandler for SimpleLayer {
+impl WgpuEguiLayer {
+    pub fn should_draw(&self) -> bool {
+        let _redraw = self.planned_redraw.lock().unwrap();
+
+        dbg!(&self.has_events, &self.can_draw, &_redraw);
+
+        if !self.can_draw {
+            return false;
+        }
+
+        if self.has_events {
+            return true;
+        }
+
+
+
+        //dbg!(&_redraw);
+
+
+        match *_redraw {
+            Redraw::Immediately => return true,
+            Redraw::Delayed(instant) => {
+                if Instant::now() >= instant {
+                    return true;
+                }
+            },
+            Redraw::Unknown => return false
+        }
+
+        return false;
+
+        // get the optional planned redraw
+
+        //self.planned_redraw.lock().unwrap().
+        /* let mut planned_redraw = self.planned_redraw.lock().unwrap();
+        if let Some(instant) = *planned_redraw {
+            dbg!(&instant);
+            dbg!(&Instant::now());
+
+
+            if Instant::now() >= instant {
+                // reset the planned redraw
+                dbg!("REDRAWING");
+                *planned_redraw = None;
+                return true;
+            }
+        }
+
+        if self.has_events {
+            return true;
+        }
+
+        return false; */
+    }
+
+
+    pub fn draw(&mut self, qh: &QueueHandle<Self>) {
+        self.can_draw = false;
+        self.has_events = false;
+        *self.planned_redraw.lock().unwrap() = Redraw::Unknown;
+
+        let full_output = self.egui_state.process_events(
+            |ctx| {
+                let my_frame = egui::containers::Frame {
+                    // #0A0A0A
+                    fill: egui::Color32::from_rgba_premultiplied(10, 10, 10, 180),
+                    inner_margin: egui::Margin::same(15f32),
+                    outer_margin: egui::Margin::same(15f32),
+                    rounding: egui::Rounding::same(8f32),
+                    shadow: Shadow {
+                        offset: egui::vec2(0f32, 0f32),
+                        blur: 10f32,
+                        spread: 5f32,
+                        color: egui::Color32::from_rgba_premultiplied(0, 0, 0, 128),
+                    },
+                    ..Default::default()
+                };
+
+                egui::CentralPanel::default()
+                .frame(my_frame)
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::widget_text::RichText::new("This is a sctk layer shell rendering an egui application with wgpu!")
+                                .color(egui::Color32::WHITE),
+                        );
+                    });
+                    ui.add(egui::widgets::Button::new("Click me!"));
+
+                    ui.text_edit_singleline(&mut self.name);
+
+                    /* ui.add(
+                        egui::widgets::ProgressBar::new(0.5)
+                            .show_percentage()
+                            .animate(true)
+                            .text("Progress bar to show an animation"),
+                    ); */
+                });
+            },
+        );
+
+
+        // iterate over full_output.viewport_output and get the repaint_delays
+        /* for (_viewport_id, output) in full_output.viewport_output.iter() {
+            if !output.repaint_delay.is_zero() {
+                dbg!(&output.repaint_delay);
+            }
+        } */
+
+        let surface_texture = self
+            .surface
+            .get_current_texture()
+            .expect("Failed to acquire next swap chain texture");
+
+        let surface_view = surface_texture
+            .texture
+            .create_view(&egui_wgpu::wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&egui_wgpu::wgpu::CommandEncoderDescriptor { label: None });
+
+        let screen_descriptor = ScreenDescriptor {
+            size_in_pixels: [self.wgpu_config.width, self.wgpu_config.height],
+            pixels_per_point: 1.0, // todo: figure out where to get that from
+        };
+
+        self.egui_state.draw(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &surface_view,
+            screen_descriptor,
+            full_output
+        );
+
+        self.layer
+            .wl_surface()
+            .frame(qh, self.layer.wl_surface().clone());
+
+        self.queue.submit(Some(encoder.finish()));
+
+        surface_texture.present();
+    
+
+    }
+}
+
+impl CompositorHandler for WgpuEguiLayer {
     fn scale_factor_changed(
         &mut self,
         _conn: &Connection,
@@ -239,16 +455,6 @@ impl CompositorHandler for SimpleLayer {
         _new_factor: i32,
     ) {
         // Not needed for this example.
-    }
-
-    fn frame(
-        &mut self,
-        _conn: &Connection,
-        qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _time: u32,
-    ) {
-        self.draw(qh);
     }
 
     fn transform_changed(
@@ -261,6 +467,16 @@ impl CompositorHandler for SimpleLayer {
         // Not needed for this example.
     }
 
+    fn frame(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _time: u32,
+    ) {
+        self.can_draw = true;
+    }
+
     fn surface_enter(
         &mut self,
         _conn: &Connection,
@@ -268,13 +484,7 @@ impl CompositorHandler for SimpleLayer {
         _surface: &wl_surface::WlSurface,
         _output: &wl_output::WlOutput,
     ) {
-        // send focus event on input
-        let egui_glow = self.egui_glow.as_mut().unwrap();
-        egui_glow.egui_input.focused = true;
-        egui_glow
-            .egui_input
-            .events
-            .push(egui::Event::WindowFocused(true));
+        // Not needed for this example
     }
 
     fn surface_leave(
@@ -284,17 +494,11 @@ impl CompositorHandler for SimpleLayer {
         _surface: &wl_surface::WlSurface,
         _output: &wl_output::WlOutput,
     ) {
-        // send focus event on input
-        let egui_glow = self.egui_glow.as_mut().unwrap();
-        egui_glow.egui_input.focused = false;
-        egui_glow
-            .egui_input
-            .events
-            .push(egui::Event::WindowFocused(false));
+        // Not needed for this example
     }
 }
 
-impl OutputHandler for SimpleLayer {
+impl OutputHandler for WgpuEguiLayer {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
     }
@@ -324,38 +528,7 @@ impl OutputHandler for SimpleLayer {
     }
 }
 
-impl LayerShellHandler for SimpleLayer {
-    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
-        self.exit = true;
-    }
-
-    fn configure(
-        &mut self,
-        _conn: &Connection,
-        qh: &QueueHandle<Self>,
-        _layer: &LayerSurface,
-        configure: LayerSurfaceConfigure,
-        _serial: u32,
-    ) {
-        if configure.new_size.0 == 0 || configure.new_size.1 == 0 {
-            self.width = 600;
-            self.height = 400;
-        } else {
-            self.width = configure.new_size.0;
-            self.height = configure.new_size.1;
-        }
-
-        // TODO: resize
-
-        // Initiate the first draw.
-        if self.first_configure {
-            self.first_configure = false;
-            self.draw(qh);
-        }
-    }
-}
-
-impl SeatHandler for SimpleLayer {
+impl SeatHandler for WgpuEguiLayer {
     fn seat_state(&mut self) -> &mut SeatState {
         &mut self.seat_state
     }
@@ -369,28 +542,6 @@ impl SeatHandler for SimpleLayer {
         seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
-        if capability == Capability::Keyboard && self.keyboard.is_none() {
-            println!("Set keyboard capability");
-            let keyboard = self
-                .seat_state
-                .get_keyboard_with_repeat(
-                    qh,
-                    &seat,
-                    None,
-                    self.loop_handle.clone(),
-                    Box::new(|state, _wl_kbd, event| {
-                        
-                        handle_key_press(
-                            event,
-                            true,
-                            &mut state.egui_glow.as_mut().unwrap().egui_input,
-                        );
-                    }),
-                )
-                .expect("Failed to create keyboard");
-            self.keyboard = Some(keyboard);
-        }
-
         if capability == Capability::Pointer && self.pointer.is_none() {
             println!("Set pointer capability");
             let pointer = self
@@ -408,11 +559,6 @@ impl SeatHandler for SimpleLayer {
         _: wl_seat::WlSeat,
         capability: Capability,
     ) {
-        if capability == Capability::Keyboard && self.keyboard.is_some() {
-            println!("Unset keyboard capability");
-            self.keyboard.take().unwrap().release();
-        }
-
         if capability == Capability::Pointer && self.pointer.is_some() {
             println!("Unset pointer capability");
             self.pointer.take().unwrap().release();
@@ -422,98 +568,95 @@ impl SeatHandler for SimpleLayer {
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
 }
 
-impl KeyboardHandler for SimpleLayer {
-    fn enter(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: &wl_surface::WlSurface,
-        _: u32,
-        _: &[u32],
-        _: &[Keysym],
-    ) {
-        let egui_glow = self.egui_glow.as_mut().unwrap();
-        egui_glow.egui_input.focused = true;
-        egui_glow
-            .egui_input
-            .events
-            .push(egui::Event::WindowFocused(true));
+delegate_compositor!(WgpuEguiLayer);
+delegate_output!(WgpuEguiLayer);
+
+delegate_seat!(WgpuEguiLayer);
+
+delegate_registry!(WgpuEguiLayer);
+
+delegate_layer!(WgpuEguiLayer);
+
+impl ProvidesRegistryState for WgpuEguiLayer {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
+    }
+    registry_handlers![OutputState];
+}
+
+impl LayerShellHandler for WgpuEguiLayer {
+    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
+        self.exit = true;
     }
 
-    fn leave(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: &wl_surface::WlSurface,
-        _: u32,
-    ) {
-        let egui_glow = self.egui_glow.as_mut().unwrap();
-        egui_glow.egui_input.focused = false;
-        egui_glow
-            .egui_input
-            .events
-            .push(egui::Event::WindowFocused(false));
-    }
-
-    fn press_key(
+    fn configure(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
-        event: KeyEvent,
-    ) {
-        handle_key_press(
-            event,
-            true,
-            &mut self.egui_glow.as_mut().unwrap().egui_input,
-        );
-    }
-
-    fn release_key(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
-        event: KeyEvent,
-    ) {
-        handle_key_press(
-            event,
-            false,
-            &mut self.egui_glow.as_mut().unwrap().egui_input,
-        );
-    }
-
-    fn update_modifiers(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
+        _layer: &LayerSurface,
+        _configure: LayerSurfaceConfigure,
         _serial: u32,
-        modifiers: Modifiers,
-        _layout: u32,
     ) {
-        let egui_glow = self.egui_glow.as_mut().unwrap();
-        egui_glow.egui_input.modifiers = egui::Modifiers {
-            alt: modifiers.alt,
-            ctrl: modifiers.ctrl,
-            shift: modifiers.shift,
-            mac_cmd: false,
-            command: modifiers.ctrl,
-        };
+        if self.first_configure {
+            self.first_configure = false;
+            //self.draw(qh);
+            self.can_draw = true;
+        }
     }
+}
 
-    fn update_repeat_info(
+delegate_pointer!(WgpuEguiLayer);
+
+impl PointerHandler for WgpuEguiLayer {
+    fn pointer_frame(
         &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _keyboard: &wl_keyboard::WlKeyboard,
-        _info: smithay_client_toolkit::seat::keyboard::RepeatInfo,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
     ) {
-        dbg!(_info);
+        for event in events {
+            let egui_event = match event.kind {
+                PointerEventKind::Enter { .. } => egui::Event::PointerMoved(egui::pos2(
+                    event.position.0 as f32,
+                    event.position.1 as f32,
+                )),
+                PointerEventKind::Leave { .. } => egui::Event::PointerGone,
+                PointerEventKind::Motion { .. } => egui::Event::PointerMoved(egui::pos2(
+                    event.position.0 as f32,
+                    event.position.1 as f32,
+                )),
+                PointerEventKind::Press { button, .. } => {
+                    if let Some(button) = translate_button(button) {
+                        egui::Event::PointerButton {
+                            button,
+                            modifiers: self.egui_state.modifiers(),
+                            pos: egui::pos2(event.position.0 as f32, event.position.1 as f32),
+                            pressed: true,
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                PointerEventKind::Release { button, .. } => {
+                    if let Some(button) = translate_button(button) {
+                        egui::Event::PointerButton {
+                            button,
+                            modifiers: self.egui_state.modifiers(),
+                            pos: egui::pos2(event.position.0 as f32, event.position.1 as f32),
+                            pressed: false,
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                // todo: implement axis event
+                _ => continue,
+            };
+            //dbg!(&egui_event);
+            self.egui_state.push_event(egui_event);
+            self.has_events = true;
+        }
     }
 }
 
@@ -526,178 +669,4 @@ fn translate_button(button: u32) -> Option<PointerButton> {
         0x114 => Some(PointerButton::Extra2),
         _ => None,
     }
-}
-
-impl PointerHandler for SimpleLayer {
-    fn pointer_frame(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_pointer::WlPointer,
-        events: &[PointerEvent],
-    ) {
-        use PointerEventKind::*;
-
-        let egui_glow = self.egui_glow.as_mut().unwrap();
-
-        for event in events {
-            let egui_event = match event.kind {
-                Press { button, .. } => {
-                    if let Some(button) = translate_button(button) {
-                        egui::Event::PointerButton {
-                            button,
-                            modifiers: egui_glow.egui_input.modifiers,
-                            pos: egui::pos2(event.position.0 as f32, event.position.1 as f32),
-                            pressed: true,
-                        }
-                    } else {
-                        continue;
-                    }
-                }
-                Release { button, .. } => {
-                    println!("Release {:x} @ {:?}", button, event.position);
-                    if let Some(button) = translate_button(button) {
-                        egui::Event::PointerButton {
-                            button,
-                            modifiers: egui_glow.egui_input.modifiers,
-                            pos: egui::pos2(event.position.0 as f32, event.position.1 as f32),
-                            pressed: false,
-                        }
-                    } else {
-                        continue;
-                    }
-                }
-                Enter { .. } => egui::Event::PointerMoved(egui::pos2(
-                    event.position.0 as f32,
-                    event.position.1 as f32,
-                )),
-                Motion { .. } => egui::Event::PointerMoved(egui::pos2(
-                    event.position.0 as f32,
-                    event.position.1 as f32,
-                )),
-                Leave { .. } => egui::Event::PointerGone,
-                _ => {
-                    continue;
-                }
-            };
-
-            egui_glow.egui_input.events.push(egui_event);
-        }
-    }
-}
-
-impl SimpleLayer {
-    pub fn draw(&mut self, qh: &QueueHandle<Self>) {
-        let window = self.layer.as_ref().unwrap();
-        let gl = self.gl.as_mut().unwrap();
-        let surface = self.surface.as_mut().unwrap();
-        let context = self.current_context.as_mut().unwrap();
-
-        let egui_glow = self.egui_glow.as_mut().unwrap();
-
-        let _repaint_after = egui_glow.run((self.width, self.height), |egui_ctx| {
-            egui::CentralPanel::default().show(egui_ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let name_label = ui.label("Your name: ");
-                    ui.text_edit_singleline(&mut self.name)
-                        .labelled_by(name_label.id);
-                });
-                if ui.button("click me").clicked() {
-                    println!("Button clicked!");
-                }
-                ui.label(format!("Hello '{}'", self.name));
-            });
-        });
-
-        egui_glow::painter::clear(
-            gl,
-            [self.width, self.height],
-            egui::Rgba::from_rgba_unmultiplied(0f32, 0f32, 0f32, 0f32).to_array(),
-        );
-
-        egui_glow.paint((self.width, self.height));
-
-        window.wl_surface().frame(qh, window.wl_surface().clone());
-
-        surface
-            .swap_buffers(context)
-            .expect("failed to swap buffers");
-    }
-}
-
-delegate_compositor!(SimpleLayer);
-delegate_output!(SimpleLayer);
-
-delegate_seat!(SimpleLayer);
-delegate_keyboard!(SimpleLayer);
-delegate_pointer!(SimpleLayer);
-
-delegate_layer!(SimpleLayer);
-
-delegate_registry!(SimpleLayer);
-
-impl ProvidesRegistryState for SimpleLayer {
-    fn registry(&mut self) -> &mut RegistryState {
-        &mut self.registry_state
-    }
-    registry_handlers![OutputState, SeatState];
-}
-
-fn init_egl(
-    surface: &wl_surface::WlSurface,
-    width: u32,
-    height: u32,
-) -> (NotCurrentContext, Surface<glutin::surface::WindowSurface>) {
-    let display_pointer = surface
-        .backend()
-        .upgrade()
-        .expect("Connection has been closed")
-        .display_ptr() as *mut _;
-
-    let display_handle =
-        raw_window_handle::WaylandDisplayHandle::new(NonNull::new(display_pointer).unwrap());
-
-    let display_handle = raw_window_handle::RawDisplayHandle::Wayland(display_handle);
-    let window_handle = raw_window_handle::WaylandWindowHandle::new(
-        NonNull::new(surface.id().as_ptr() as *mut _).unwrap(),
-    );
-    let window_handle = raw_window_handle::RawWindowHandle::Wayland(window_handle);
-
-    let display = unsafe { glutin::api::egl::display::Display::new(display_handle) }
-        .expect("Failed to initialize Wayland EGL platform");
-
-    // Find a suitable config for the window.
-    let config_template = glutin::config::ConfigTemplateBuilder::default()
-        .compatible_with_native_window(window_handle)
-        .with_surface_type(ConfigSurfaceTypes::WINDOW)
-        .with_api(
-            glutin::config::Api::GLES2 | glutin::config::Api::GLES3 | glutin::config::Api::OPENGL,
-        )
-        .build();
-    let display_config = unsafe { display.find_configs(config_template) }
-        .unwrap()
-        .next()
-        .expect("No available configs");
-    let gl_attributes = glutin::context::ContextAttributesBuilder::default()
-        .with_context_api(glutin::context::ContextApi::OpenGl(None))
-        .build(Some(window_handle));
-    let gles_attributes = glutin::context::ContextAttributesBuilder::default()
-        .with_context_api(glutin::context::ContextApi::Gles(None))
-        .build(Some(window_handle));
-
-    // Create a context, trying OpenGL and then Gles.
-    let not_current_context = unsafe { display.create_context(&display_config, &gl_attributes) }
-        .or_else(|_| unsafe { display.create_context(&display_config, &gles_attributes) })
-        .expect("Failed to create context");
-
-    let surface_attributes = glutin::surface::SurfaceAttributesBuilder::<WindowSurface>::default()
-        .build(
-            window_handle,
-            NonZeroU32::new(width).unwrap(),
-            NonZeroU32::new(height).unwrap(),
-        );
-    let surface = unsafe { display.create_window_surface(&display_config, &surface_attributes) }
-        .expect("Failed to create surface");
-
-    (not_current_context, surface)
 }
