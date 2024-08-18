@@ -1,12 +1,12 @@
-//mod egui_renderer;
 mod egui_state;
 mod keys;
 
-use egui::{PointerButton, Shadow, TextBuffer};
-//use egui_renderer::EguiRenderer;
+use egui::{PointerButton, Shadow};
 use egui_wgpu::{
     wgpu::{
-        hal::auxil::db, Adapter, Backends, Device, Instance, InstanceDescriptor, PresentMode, Queue, RequestAdapterOptions, Surface, SurfaceConfiguration, SurfaceTargetUnsafe, TextureFormat, TextureUsages
+        Adapter, Backends, Device, Instance, InstanceDescriptor, PresentMode, Queue,
+        RequestAdapterOptions, Surface, SurfaceConfiguration, SurfaceTargetUnsafe, TextureFormat,
+        TextureUsages,
     },
     ScreenDescriptor,
 };
@@ -19,11 +19,7 @@ use smithay_client_toolkit::{
     delegate_seat,
     output::{OutputHandler, OutputState},
     reexports::{
-        calloop::{
-            ping::make_ping,
-            timer::{TimeoutAction, Timer},
-            EventLoop, LoopHandle,
-        },
+        calloop::{EventLoop, LoopHandle},
         calloop_wayland_source::WaylandSource,
     },
     registry::{ProvidesRegistryState, RegistryState},
@@ -31,7 +27,7 @@ use smithay_client_toolkit::{
     seat::{
         pointer::{
             PointerEvent,
-            PointerEventKind::{self, Enter, Leave},
+            PointerEventKind::{self},
             PointerHandler,
         },
         Capability, SeatHandler, SeatState,
@@ -45,20 +41,15 @@ use smithay_client_toolkit::{
     },
 };
 use std::{
-    borrow::Borrow, cell::RefCell, ptr::NonNull, sync::{atomic::AtomicBool, Arc, Mutex}, time::{Duration, Instant}
+    ptr::NonNull,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_output, wl_pointer, wl_seat, wl_surface},
     Connection, Proxy, QueueHandle,
 };
-
-#[derive(Debug)]
-enum Redraw {
-    Unknown,
-    Immediately,
-    Delayed(Instant),
-}
 
 fn main() {
     env_logger::init();
@@ -67,7 +58,7 @@ fn main() {
     let initial_height = 300;
 
     let conn = Connection::connect_to_env().unwrap();
-    let (globals, mut event_queue) = registry_queue_init(&conn).unwrap();
+    let (globals, event_queue) = registry_queue_init(&conn).unwrap();
     let qh: Arc<QueueHandle<WgpuEguiLayer>> = Arc::new(event_queue.handle());
 
     let mut event_loop: EventLoop<WgpuEguiLayer> =
@@ -78,19 +69,6 @@ fn main() {
         .insert(loop_handle)
         .unwrap();
 
-    // Setup the user proxy.
-    let (ping, ping_source) = make_ping().unwrap();
-    let foo_handle = qh.clone();
-    let result = event_loop
-        .handle()
-        .insert_source(ping_source, move |_, _, state: &mut WgpuEguiLayer| {
-            state.needs_redraw = true;
-        })
-        .map_err(|error| error.error);
-
-    let ping_proxy = Arc::new(Mutex::new(ping));
-
-    // Initialize xdg_shell handlers so we can select the correct adapter
     let compositor_state =
         CompositorState::bind(&globals, &qh).expect("wl_compositor not available");
 
@@ -160,20 +138,17 @@ fn main() {
 
     let egui_context = egui::Context::default();
 
-    let planned_redraw = Arc::new(Mutex::new(Redraw::Immediately));
-    let planned_redraw_clone = planned_redraw.clone();
-    
-    
-    egui_context.set_request_repaint_callback(move |info| {
-        let mut redraw = planned_redraw_clone.lock().unwrap();
-        if info.delay == Duration::ZERO {
-            *redraw = Redraw::Immediately;
-        } else {
-            *redraw = Redraw::Delayed(Instant::now() + info.delay);
-        }
-        ping_proxy.lock().unwrap().ping();
-    });
+    let redraw_at = Arc::new(Mutex::new(None));
+    let redraw_at_clone = redraw_at.clone();
 
+    egui_context.set_request_repaint_callback(move |info| {
+        let mut redraw_at = redraw_at_clone.lock().unwrap();
+        if info.delay == Duration::ZERO {
+            *redraw_at = Some(Instant::now());
+        } else {
+            *redraw_at = Some(Instant::now() + info.delay);
+        }
+    });
 
     let egui_state = egui_state::State::new(
         egui_context,
@@ -183,8 +158,6 @@ fn main() {
         None,
         1,
     );
-
-    //let egui_renderer = EguiRenderer::new(&device, config.format, None, 1);
 
     let mut wgpu = WgpuEguiLayer {
         registry_state: RegistryState::new(&globals),
@@ -208,50 +181,29 @@ fn main() {
         loop_handle: event_loop.handle(),
 
         pointer: None,
-        needs_redraw: true,
         name: "foo".to_string(),
 
         can_draw: false,
-        planned_redraw,
-        has_events: true
+        has_events: true,
+
+        redraw_at: redraw_at,
     };
 
 
-    /* let planned_redraw = wgpu.planned_redraw.clone();
-    wgpu.egui_state.context().set_request_repaint_callback(move |info| {
-        dbg!(&info.delay);
-        if info.delay == Duration::ZERO {
-            return;
-        }
-        let instant = Instant::now() + info.delay as Duration;
-        dbg!("PLANNED REDRAW!");
-        let mut planned_redraw = planned_redraw.lock().unwrap();
-        *planned_redraw = Some(instant);
-    }); */
-
-
-    // We don't draw immediately, the configure will notify us when to first draw.
     loop {
-        let timeout;
+        let timeout = {
+            let redraw_at = wgpu.redraw_at.lock().unwrap();
+            match *redraw_at {
+                Some(instant) => Some(instant - Instant::now()),
+                None => None,
+            }
+        };
 
-        {
-            let foo = wgpu.planned_redraw.lock().unwrap();
-            timeout = match *foo {
-                Redraw::Immediately => None,
-                Redraw::Delayed(instant) => Some(instant - Instant::now()),
-                Redraw::Unknown => None
-            };
-        }
-        //dbg!(timeout);
         event_loop.dispatch(timeout, &mut wgpu).unwrap();
-        //event_queue.blocking_dispatch(&mut wgpu).unwrap();
-
-        //dbg!(&wgpu.planned_redraw.lock().unwrap());
 
         if wgpu.should_draw() {
             wgpu.draw(&qh);
         }
-
 
         if wgpu.exit {
             println!("exiting example");
@@ -288,21 +240,18 @@ struct WgpuEguiLayer {
     loop_handle: LoopHandle<'static, WgpuEguiLayer>,
 
     pointer: Option<wl_pointer::WlPointer>,
-    needs_redraw: bool,
 
     name: String,
 
-
     can_draw: bool,
-    planned_redraw: Arc<Mutex<Redraw>>,
-    has_events: bool
+    has_events: bool,
+
+    redraw_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl WgpuEguiLayer {
     pub fn should_draw(&self) -> bool {
-        let _redraw = self.planned_redraw.lock().unwrap();
-
-        dbg!(&self.has_events, &self.can_draw, &_redraw);
+        let redraw_at = self.redraw_at.lock().unwrap();
 
         if !self.can_draw {
             return false;
@@ -312,52 +261,22 @@ impl WgpuEguiLayer {
             return true;
         }
 
-
-
-        //dbg!(&_redraw);
-
-
-        match *_redraw {
-            Redraw::Immediately => return true,
-            Redraw::Delayed(instant) => {
-                if Instant::now() >= instant {
+        match redraw_at.as_ref() {
+            Some(instant) => {
+                if Instant::now() >= *instant {
                     return true;
                 }
-            },
-            Redraw::Unknown => return false
+            }
+            None => return false,
         }
 
         return false;
-
-        // get the optional planned redraw
-
-        //self.planned_redraw.lock().unwrap().
-        /* let mut planned_redraw = self.planned_redraw.lock().unwrap();
-        if let Some(instant) = *planned_redraw {
-            dbg!(&instant);
-            dbg!(&Instant::now());
-
-
-            if Instant::now() >= instant {
-                // reset the planned redraw
-                dbg!("REDRAWING");
-                *planned_redraw = None;
-                return true;
-            }
-        }
-
-        if self.has_events {
-            return true;
-        }
-
-        return false; */
     }
-
 
     pub fn draw(&mut self, qh: &QueueHandle<Self>) {
         self.can_draw = false;
         self.has_events = false;
-        *self.planned_redraw.lock().unwrap() = Redraw::Unknown;
+        *self.redraw_at.lock().unwrap() = None;
 
         let full_output = self.egui_state.process_events(
             |ctx| {
@@ -399,7 +318,6 @@ impl WgpuEguiLayer {
             },
         );
 
-
         // iterate over full_output.viewport_output and get the repaint_delays
         /* for (_viewport_id, output) in full_output.viewport_output.iter() {
             if !output.repaint_delay.is_zero() {
@@ -431,7 +349,7 @@ impl WgpuEguiLayer {
             &mut encoder,
             &surface_view,
             screen_descriptor,
-            full_output
+            full_output,
         );
 
         self.layer
@@ -441,8 +359,6 @@ impl WgpuEguiLayer {
         self.queue.submit(Some(encoder.finish()));
 
         surface_texture.present();
-    
-
     }
 }
 
@@ -470,7 +386,7 @@ impl CompositorHandler for WgpuEguiLayer {
     fn frame(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
