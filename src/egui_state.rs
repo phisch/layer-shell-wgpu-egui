@@ -80,9 +80,7 @@ impl State {
         /* if (&raw_input.events).len() > 0 {
             dbg!(&raw_input.events);
         } */
-        self.context.run(raw_input, |ui| {
-            run_ui(ui);
-        })
+        self.context.run(raw_input, run_ui)
     }
 
     pub fn draw(

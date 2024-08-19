@@ -1,25 +1,13 @@
-mod egui_state;
-mod keys;
-
 use egui::{PointerButton, Shadow};
-use egui_wgpu::{
-    wgpu::{
-        Adapter, Backends, Device, Instance, InstanceDescriptor, PresentMode, Queue,
-        RequestAdapterOptions, Surface, SurfaceConfiguration, SurfaceTargetUnsafe, TextureFormat,
-        TextureUsages,
-    },
-    ScreenDescriptor,
-};
-use raw_window_handle::{
-    RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
-};
+use egui_sctk::wgpu_state::WgpuState;
+use egui_wgpu::ScreenDescriptor;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
     delegate_seat,
     output::{OutputHandler, OutputState},
     reexports::{
-        calloop::{EventLoop, LoopHandle},
+        calloop::EventLoop,
         calloop_wayland_source::WaylandSource,
     },
     registry::{ProvidesRegistryState, RegistryState},
@@ -41,14 +29,13 @@ use smithay_client_toolkit::{
     },
 };
 use std::{
-    ptr::NonNull,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_output, wl_pointer, wl_seat, wl_surface},
-    Connection, Proxy, QueueHandle,
+    Connection, QueueHandle,
 };
 
 fn main() {
@@ -57,128 +44,78 @@ fn main() {
     let initial_width = 600;
     let initial_height = 300;
 
-    let conn = Connection::connect_to_env().unwrap();
-    let (globals, event_queue) = registry_queue_init(&conn).unwrap();
-    let qh: Arc<QueueHandle<WgpuEguiLayer>> = Arc::new(event_queue.handle());
+    let connection = Connection::connect_to_env().unwrap();
+    let (global_list, event_queue) = registry_queue_init(&connection).unwrap();
+    let queue_handle: Arc<QueueHandle<WgpuEguiLayer>> = Arc::new(event_queue.handle());
 
     let mut event_loop: EventLoop<WgpuEguiLayer> =
         EventLoop::try_new().expect("Could not create event loop.");
 
-    let loop_handle = event_loop.handle();
-    WaylandSource::new(conn.clone(), event_queue)
-        .insert(loop_handle)
+    WaylandSource::new(connection.clone(), event_queue)
+        .insert(event_loop.handle())
         .unwrap();
 
     let compositor_state =
-        CompositorState::bind(&globals, &qh).expect("wl_compositor not available");
+        CompositorState::bind(&global_list, &queue_handle).expect("wl_compositor not available");
 
-    let surface = compositor_state.create_surface(&qh);
+    let wl_surface = compositor_state.create_surface(&queue_handle);
 
-    let layer_state = LayerShell::bind(&globals, &qh).expect("layer shell not available");
-    let layer =
-        layer_state.create_layer_surface(&qh, surface, Layer::Top, Some("wgpu_egui_layer"), None);
-    layer.set_anchor(Anchor::TOP);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
-    layer.set_size(initial_width, initial_height);
-    layer.commit();
+    let layer_shell =
+        LayerShell::bind(&global_list, &queue_handle).expect("layer shell not available");
+    let layer_surface = layer_shell.create_layer_surface(
+        &queue_handle,
+        wl_surface,
+        Layer::Top,
+        Some("wgpu_egui_layer"),
+        None,
+    );
+    layer_surface.set_anchor(Anchor::TOP);
+    layer_surface.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+    layer_surface.set_size(initial_width, initial_height);
+    layer_surface.commit();
 
-    // Initialize wgpu
-    let instance = Instance::new(InstanceDescriptor {
-        backends: Backends::all(),
-        ..Default::default()
-    });
-
-    // Create the raw window handle for the surface.
-    let raw_display_handle = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
-        NonNull::new(conn.backend().display_ptr() as *mut _).unwrap(),
-    ));
-    let raw_window_handle = RawWindowHandle::Wayland(WaylandWindowHandle::new(
-        NonNull::new(layer.wl_surface().id().as_ptr() as *mut _).unwrap(),
-    ));
-
-    let surface = unsafe {
-        instance
-            .create_surface_unsafe(SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle,
-                raw_window_handle,
-            })
-            .unwrap()
-    };
-
-    // Pick a supported adapter
-    let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
-        compatible_surface: Some(&surface),
-        ..Default::default()
-    }))
-    .expect("Failed to find suitable adapter");
-
-    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None))
-        .expect("Failed to request device");
-
-    let swapchain_capabilities = surface.get_capabilities(&adapter);
-    let selected_format = TextureFormat::Bgra8UnormSrgb;
-    let swapchain_format = swapchain_capabilities
-        .formats
-        .iter()
-        .find(|d| **d == selected_format)
-        .expect("failed to select proper surface texture format!");
-
-    let config = SurfaceConfiguration {
-        usage: TextureUsages::RENDER_ATTACHMENT,
-        format: *swapchain_format,
-        width: 600,
-        height: 300,
-        present_mode: PresentMode::Mailbox,
-        desired_maximum_frame_latency: 2,
-        alpha_mode: egui_wgpu::wgpu::CompositeAlphaMode::PreMultiplied,
-        view_formats: vec![*swapchain_format],
-    };
-
-    surface.configure(&device, &config);
+    let wgpu_state = WgpuState::new(&connection.backend(), layer_surface.wl_surface()).unwrap();
 
     let egui_context = egui::Context::default();
 
     let redraw_at = Arc::new(Mutex::new(None));
-    let redraw_at_clone = redraw_at.clone();
 
-    egui_context.set_request_repaint_callback(move |info| {
-        let mut redraw_at = redraw_at_clone.lock().unwrap();
-        if info.delay == Duration::ZERO {
-            *redraw_at = Some(Instant::now());
-        } else {
-            *redraw_at = Some(Instant::now() + info.delay);
+    egui_context.set_request_repaint_callback({
+        let redraw_at = Arc::clone(&redraw_at);
+        move |info| {
+            let mut redraw_at = redraw_at.lock().unwrap();
+            if info.delay == Duration::ZERO {
+                *redraw_at = Some(Instant::now());
+            } else {
+                *redraw_at = Some(Instant::now() + info.delay);
+            }
+
+            dbg!("SET TO SOME");
         }
     });
 
-    let egui_state = egui_state::State::new(
+    let egui_state = egui_sctk::egui_state::State::new(
         egui_context,
         egui::viewport::ViewportId::ROOT,
-        &device,
-        config.format,
+        &wgpu_state.device,
+        wgpu_state.surface_configuration.format,
         None,
         1,
     );
 
     let mut wgpu = WgpuEguiLayer {
-        registry_state: RegistryState::new(&globals),
-        seat_state: SeatState::new(&globals, &qh),
-        output_state: OutputState::new(&globals, &qh),
+        registry_state: RegistryState::new(&global_list),
+        seat_state: SeatState::new(&global_list, &queue_handle),
+        output_state: OutputState::new(&global_list, &queue_handle),
 
         exit: false,
         width: initial_width,
         height: initial_height,
-        layer,
-        device,
-        surface,
-        adapter,
-        queue,
+        layer: layer_surface,
 
         egui_state,
-        //egui_renderer,
-        wgpu_config: config,
 
         first_configure: true,
-        loop_handle: event_loop.handle(),
 
         pointer: None,
         name: "foo".to_string(),
@@ -187,8 +124,10 @@ fn main() {
         has_events: true,
 
         redraw_at: redraw_at,
-    };
+        //render_state: None
 
+        wgpu_state,
+    };
 
     loop {
         let timeout = {
@@ -202,7 +141,7 @@ fn main() {
         event_loop.dispatch(timeout, &mut wgpu).unwrap();
 
         if wgpu.should_draw() {
-            wgpu.draw(&qh);
+            wgpu.draw(&queue_handle);
         }
 
         if wgpu.exit {
@@ -212,46 +151,43 @@ fn main() {
     }
 
     // On exit we must destroy the surface before the window is destroyed.
-    drop(wgpu.surface);
+    drop(wgpu.wgpu_state.surface);
     drop(wgpu.layer);
 }
 
+
 struct WgpuEguiLayer {
-    registry_state: RegistryState,
-    seat_state: SeatState,
-    output_state: OutputState,
+    registry_state: RegistryState, // SCTK
+    seat_state: SeatState,         // SCTK
+    output_state: OutputState,     // SCTK
 
-    exit: bool,
-    width: u32,
-    height: u32,
-    layer: LayerSurface,
+    exit: bool,          // Application
+    width: u32,          // Application
+    height: u32,         // Application
+    layer: LayerSurface, // SCTK
 
-    adapter: Adapter,
-    device: Device,
-    queue: Queue,
-    surface: Surface<'static>,
-
-    egui_state: egui_state::State,
+    egui_state: egui_sctk::egui_state::State,
     //egui_renderer: EguiRenderer,
-    wgpu_config: egui_wgpu::wgpu::SurfaceConfiguration,
 
-    first_configure: bool,
+    first_configure: bool, // SCTK
 
-    loop_handle: LoopHandle<'static, WgpuEguiLayer>,
+    pointer: Option<wl_pointer::WlPointer>, // SCTK
 
-    pointer: Option<wl_pointer::WlPointer>,
+    name: String, // Application
 
-    name: String,
+    can_draw: bool,   // SCTK should be named has_frame_callback
+    has_events: bool, // SCTK
 
-    can_draw: bool,
-    has_events: bool,
+    redraw_at: Arc<Mutex<Option<Instant>>>, // SCTK but is managed by egui_state
 
-    redraw_at: Arc<Mutex<Option<Instant>>>,
+    //render_state: egui_wgpu::RenderState
+
+    wgpu_state: WgpuState,
 }
 
 impl WgpuEguiLayer {
     pub fn should_draw(&self) -> bool {
-        let redraw_at = self.redraw_at.lock().unwrap();
+        let mut redraw_at = self.redraw_at.lock().unwrap();
 
         if !self.can_draw {
             return false;
@@ -264,6 +200,7 @@ impl WgpuEguiLayer {
         match redraw_at.as_ref() {
             Some(instant) => {
                 if Instant::now() >= *instant {
+                    *redraw_at = None;
                     return true;
                 }
             }
@@ -276,7 +213,6 @@ impl WgpuEguiLayer {
     pub fn draw(&mut self, qh: &QueueHandle<Self>) {
         self.can_draw = false;
         self.has_events = false;
-        *self.redraw_at.lock().unwrap() = None;
 
         let full_output = self.egui_state.process_events(
             |ctx| {
@@ -326,7 +262,7 @@ impl WgpuEguiLayer {
         } */
 
         let surface_texture = self
-            .surface
+            .wgpu_state.surface
             .get_current_texture()
             .expect("Failed to acquire next swap chain texture");
 
@@ -335,17 +271,17 @@ impl WgpuEguiLayer {
             .create_view(&egui_wgpu::wgpu::TextureViewDescriptor::default());
 
         let mut encoder = self
-            .device
+            .wgpu_state.device
             .create_command_encoder(&egui_wgpu::wgpu::CommandEncoderDescriptor { label: None });
 
         let screen_descriptor = ScreenDescriptor {
-            size_in_pixels: [self.wgpu_config.width, self.wgpu_config.height],
+            size_in_pixels: [self.wgpu_state.surface_configuration.width, self.wgpu_state.surface_configuration.height],
             pixels_per_point: 1.0, // todo: figure out where to get that from
         };
 
         self.egui_state.draw(
-            &self.device,
-            &self.queue,
+            &self.wgpu_state.device,
+            &self.wgpu_state.queue,
             &mut encoder,
             &surface_view,
             screen_descriptor,
@@ -356,7 +292,7 @@ impl WgpuEguiLayer {
             .wl_surface()
             .frame(qh, self.layer.wl_surface().clone());
 
-        self.queue.submit(Some(encoder.finish()));
+        self.wgpu_state.queue.submit(Some(encoder.finish()));
 
         surface_texture.present();
     }
