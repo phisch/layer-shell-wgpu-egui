@@ -392,6 +392,7 @@ dependencies = [
  "pollster",
  "raw-window-handle",
  "smithay-client-toolkit",
+ "thiserror",
  "wayland-backend",
  "wayland-client",
  "wgpu",

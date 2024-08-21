@@ -12,6 +12,7 @@ env_logger = "0.11.5"
 pollster = "0.3.0"
 raw-window-handle = "0.6.2"
 smithay-client-toolkit = "0.19.2"
+thiserror = "1.0.63"
 wayland-backend = { version = "0.3.6", features = ["client_system"] }
 wayland-client = "0.31.5"
 wgpu = "0.20.1"
