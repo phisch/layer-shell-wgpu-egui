@@ -1,7 +1,7 @@
-fn main() -> egui_sctk::Result {
+fn main() -> layer_shell_wgpu_egui::Result {
     env_logger::init();
 
-    let options = egui_sctk::LayerShellOptions {
+    let options = layer_shell_wgpu_egui::LayerShellOptions {
         ..Default::default()
     };
 
@@ -9,14 +9,13 @@ fn main() -> egui_sctk::Result {
     Ok(())
 }
 
-
 #[derive(Default)]
 struct MyApp {
     name: String,
-    age: u8,    
+    age: u8,
 }
 
-impl egui_sctk::App for MyApp {
+impl layer_shell_wgpu_egui::App for MyApp {
     fn update(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {

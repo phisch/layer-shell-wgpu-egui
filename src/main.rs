@@ -1,15 +1,12 @@
 use egui::{PointerButton, Shadow};
-use egui_sctk::wgpu_state::WgpuState;
 use egui_wgpu::ScreenDescriptor;
+use layer_shell_wgpu_egui::wgpu_state::WgpuState;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
     delegate_seat,
     output::{OutputHandler, OutputState},
-    reexports::{
-        calloop::EventLoop,
-        calloop_wayland_source::WaylandSource,
-    },
+    reexports::{calloop::EventLoop, calloop_wayland_source::WaylandSource},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
@@ -29,7 +26,7 @@ use smithay_client_toolkit::{
     },
 };
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 use wayland_client::{
@@ -40,23 +37,26 @@ use wayland_client::{
 
 fn main() {
     env_logger::init();
-
-    let mut event_loop: EventLoop<LayerShellWgpuEgui> = EventLoop::try_new().expect("Could not create event loop.");
+    let mut event_loop: EventLoop<LayerShellWgpuEgui> =
+        EventLoop::try_new().expect("Could not create event loop.");
     let mut wgpu = LayerShellWgpuEgui::new(&event_loop);
 
     loop {
-        let timeout = {
-            let redraw_at = wgpu.redraw_at.lock().unwrap();
-            match *redraw_at {
-                Some(instant) => Some(instant - Instant::now()),
-                None => None,
+        let timeout = match *wgpu.redraw_at.read().unwrap() {
+            Some(instant) => {
+                if wgpu.can_draw {
+                    Some(instant.duration_since(Instant::now()))
+                } else {
+                    None
+                }
             }
+            None => None,
         };
-        
-        // TODO: figure out why the hell this dispatch is not blocking, it should be blocking?!?
+
         event_loop.dispatch(timeout, &mut wgpu).unwrap();
-        
-        wgpu.draw();
+        if wgpu.should_draw() {
+            wgpu.draw();
+        }
 
         if wgpu.exit {
             println!("exiting example");
@@ -68,32 +68,28 @@ fn main() {
     drop(wgpu.layer);
 }
 
-
 struct LayerShellWgpuEgui {
-    registry_state: RegistryState, // SCTK
-    seat_state: SeatState,         // SCTK
-    output_state: OutputState,     // SCTK
+    registry_state: RegistryState,
+    seat_state: SeatState,
+    output_state: OutputState,
 
-    exit: bool,          // Application
-    width: u32,          // Application
-    height: u32,         // Application
-    layer: LayerSurface, // SCTK
+    exit: bool,
+    width: u32,
+    height: u32,
+    layer: LayerSurface,
 
-    egui_state: egui_sctk::egui_state::State,
-    //egui_renderer: EguiRenderer,
+    egui_state: layer_shell_wgpu_egui::egui_state::State,
 
-    first_configure: bool, // SCTK
+    first_configure: bool,
 
-    pointer: Option<wl_pointer::WlPointer>, // SCTK
+    pointer: Option<wl_pointer::WlPointer>,
 
-    name: String, // Application
+    name: String,
 
-    can_draw: bool,   // SCTK should be named has_frame_callback
-    has_events: bool, // SCTK
+    can_draw: bool,
+    has_events: bool,
 
-    redraw_at: Arc<Mutex<Option<Instant>>>, // SCTK but is managed by egui_state
-
-    //render_state: egui_wgpu::RenderState
+    redraw_at: Arc<RwLock<Option<Instant>>>,
 
     wgpu_state: WgpuState,
 
@@ -101,24 +97,23 @@ struct LayerShellWgpuEgui {
 }
 
 impl LayerShellWgpuEgui {
-
     pub fn new(event_loop: &EventLoop<Self>) -> Self {
         let initial_width = 600;
         let initial_height = 300;
-    
+
         let connection = Connection::connect_to_env().unwrap();
         let (global_list, event_queue) = registry_queue_init(&connection).unwrap();
         let queue_handle: Arc<QueueHandle<LayerShellWgpuEgui>> = Arc::new(event_queue.handle());
-    
+
         WaylandSource::new(connection.clone(), event_queue)
             .insert(event_loop.handle())
             .unwrap();
-    
-        let compositor_state =
-            CompositorState::bind(&global_list, &queue_handle).expect("wl_compositor not available");
-    
+
+        let compositor_state = CompositorState::bind(&global_list, &queue_handle)
+            .expect("wl_compositor not available");
+
         let wl_surface = compositor_state.create_surface(&queue_handle);
-    
+
         let layer_shell =
             LayerShell::bind(&global_list, &queue_handle).expect("layer shell not available");
         let layer_surface = layer_shell.create_layer_surface(
@@ -132,26 +127,22 @@ impl LayerShellWgpuEgui {
         layer_surface.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
         layer_surface.set_size(initial_width, initial_height);
         layer_surface.commit();
-    
+
         let wgpu_state = WgpuState::new(&connection.backend(), layer_surface.wl_surface()).unwrap();
-    
+
         let egui_context = egui::Context::default();
-    
-        let redraw_at = Arc::new(Mutex::new(None));
-    
+
+        let redraw_at = Arc::new(RwLock::new(None));
+
         egui_context.set_request_repaint_callback({
             let redraw_at = Arc::clone(&redraw_at);
             move |info| {
-                let mut redraw_at = redraw_at.lock().unwrap();
-                if info.delay == Duration::ZERO {
-                    *redraw_at = Some(Instant::now());
-                } else {
-                    *redraw_at = Some(Instant::now() + info.delay);
-                }
+                let mut redraw_at = redraw_at.write().unwrap();
+                *redraw_at = Some(Instant::now() + info.delay);
             }
         });
-    
-        let egui_state = egui_sctk::egui_state::State::new(
+
+        let egui_state = layer_shell_wgpu_egui::egui_state::State::new(
             egui_context,
             egui::viewport::ViewportId::ROOT,
             &wgpu_state.device,
@@ -159,45 +150,33 @@ impl LayerShellWgpuEgui {
             None,
             1,
         );
-    
+
         LayerShellWgpuEgui {
             registry_state: RegistryState::new(&global_list),
             seat_state: SeatState::new(&global_list, &queue_handle),
             output_state: OutputState::new(&global_list, &queue_handle),
-    
+
             exit: false,
             width: initial_width,
             height: initial_height,
             layer: layer_surface,
-    
+
             egui_state,
-    
+
             first_configure: true,
-    
+
             pointer: None,
             name: "foo".to_string(),
-    
+
             can_draw: false,
             has_events: true,
-    
-            redraw_at: redraw_at,
-            //render_state: None
-    
             wgpu_state,
-            queue_handle
+            queue_handle,
+            redraw_at,
         }
     }
 
-
-
-
-
-
-
-
     pub fn should_draw(&self) -> bool {
-        let mut redraw_at = self.redraw_at.lock().unwrap();
-
         if !self.can_draw {
             return false;
         }
@@ -206,25 +185,23 @@ impl LayerShellWgpuEgui {
             return true;
         }
 
-        match redraw_at.as_ref() {
-            Some(instant) => {
-                if Instant::now() >= *instant {
-                    *redraw_at = None;
+        let redraw_at = *self.redraw_at.read().unwrap();
+        match redraw_at {
+            Some(time) => {
+                if time.duration_since(Instant::now()).as_millis()
+                    <= Duration::from_millis(0).as_millis()
+                {
                     return true;
                 }
             }
-            None => return false,
+            None => {}
         }
 
         return false;
     }
 
     pub fn draw(&mut self) {
-
-        if !self.should_draw() {
-            return;
-        }
-
+        *self.redraw_at.write().unwrap() = None;
         self.can_draw = false;
         self.has_events = false;
 
@@ -258,18 +235,19 @@ impl LayerShellWgpuEgui {
 
                     ui.text_edit_singleline(&mut self.name);
 
-                    ui.add(
-                        egui::widgets::ProgressBar::new(0.5)
-                            .show_percentage()
-                            .animate(true)
-                            .text("Progress bar to show an animation"),
-                    );
+                    // ui.add(
+                    //     egui::widgets::ProgressBar::new(0.5)
+                    //         .show_percentage()
+                    //         .animate(true)
+                    //         .text("Progress bar to show an animation"),
+                    // );
                 });
             },
         );
 
         let surface_texture = self
-            .wgpu_state.surface
+            .wgpu_state
+            .surface
             .get_current_texture()
             .expect("Failed to acquire next swap chain texture");
 
@@ -278,11 +256,15 @@ impl LayerShellWgpuEgui {
             .create_view(&egui_wgpu::wgpu::TextureViewDescriptor::default());
 
         let mut encoder = self
-            .wgpu_state.device
+            .wgpu_state
+            .device
             .create_command_encoder(&egui_wgpu::wgpu::CommandEncoderDescriptor { label: None });
 
         let screen_descriptor = ScreenDescriptor {
-            size_in_pixels: [self.wgpu_state.surface_configuration.width, self.wgpu_state.surface_configuration.height],
+            size_in_pixels: [
+                self.wgpu_state.surface_configuration.width,
+                self.wgpu_state.surface_configuration.height,
+            ],
             pixels_per_point: 1.0, // todo: figure out where to get that from
         };
 
@@ -294,12 +276,11 @@ impl LayerShellWgpuEgui {
             screen_descriptor,
             full_output,
         );
+        self.wgpu_state.queue.submit(Some(encoder.finish()));
 
         self.layer
             .wl_surface()
             .frame(&self.queue_handle, self.layer.wl_surface().clone());
-
-        self.wgpu_state.queue.submit(Some(encoder.finish()));
 
         surface_texture.present();
     }
@@ -313,7 +294,6 @@ impl CompositorHandler for LayerShellWgpuEgui {
         _surface: &wl_surface::WlSurface,
         _new_factor: i32,
     ) {
-        // Not needed for this example.
     }
 
     fn transform_changed(
@@ -323,7 +303,6 @@ impl CompositorHandler for LayerShellWgpuEgui {
         _surface: &wl_surface::WlSurface,
         _new_transform: wl_output::Transform,
     ) {
-        // Not needed for this example.
     }
 
     fn frame(
@@ -343,7 +322,6 @@ impl CompositorHandler for LayerShellWgpuEgui {
         _surface: &wl_surface::WlSurface,
         _output: &wl_output::WlOutput,
     ) {
-        // Not needed for this example
     }
 
     fn surface_leave(
@@ -353,7 +331,6 @@ impl CompositorHandler for LayerShellWgpuEgui {
         _surface: &wl_surface::WlSurface,
         _output: &wl_output::WlOutput,
     ) {
-        // Not needed for this example
     }
 }
 
@@ -402,7 +379,6 @@ impl SeatHandler for LayerShellWgpuEgui {
         capability: Capability,
     ) {
         if capability == Capability::Pointer && self.pointer.is_none() {
-            println!("Set pointer capability");
             let pointer = self
                 .seat_state
                 .get_pointer(qh, &seat)
@@ -419,7 +395,6 @@ impl SeatHandler for LayerShellWgpuEgui {
         capability: Capability,
     ) {
         if capability == Capability::Pointer && self.pointer.is_some() {
-            println!("Unset pointer capability");
             self.pointer.take().unwrap().release();
         }
     }
