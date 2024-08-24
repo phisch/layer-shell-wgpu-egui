@@ -27,7 +27,7 @@ use smithay_client_toolkit::{
 };
 use std::{
     sync::{Arc, RwLock},
-    time::{Duration, Instant},
+    time::Instant,
 };
 use wayland_client::{
     globals::registry_queue_init,
@@ -74,8 +74,6 @@ struct LayerShellWgpuEgui {
     output_state: OutputState,
 
     exit: bool,
-    width: u32,
-    height: u32,
     layer: LayerSurface,
 
     egui_state: layer_shell_wgpu_egui::egui_state::State,
@@ -157,8 +155,6 @@ impl LayerShellWgpuEgui {
             output_state: OutputState::new(&global_list, &queue_handle),
 
             exit: false,
-            width: initial_width,
-            height: initial_height,
             layer: layer_surface,
 
             egui_state,
@@ -185,19 +181,10 @@ impl LayerShellWgpuEgui {
             return true;
         }
 
-        let redraw_at = *self.redraw_at.read().unwrap();
-        match redraw_at {
-            Some(time) => {
-                if time.duration_since(Instant::now()).as_millis()
-                    <= Duration::from_millis(0).as_millis()
-                {
-                    return true;
-                }
-            }
-            None => {}
+        match *self.redraw_at.read().unwrap() {
+            Some(time) => time <= Instant::now(),
+            None => false,
         }
-
-        return false;
     }
 
     pub fn draw(&mut self) {
