@@ -1,41 +1,40 @@
 use egui::{Modifiers, RawInput};
 use smithay_client_toolkit::seat::keyboard::{KeyEvent, Keysym};
 
-fn is_copy(key: egui::Key, modifiers: Modifiers) -> bool {
-    key == egui::Key::C && modifiers.ctrl
-}
+fn handle_clipboard_shortcuts(key: egui::Key, modifiers: Modifiers, egui_input: &mut RawInput) -> bool {
+    let event = match (key, modifiers.ctrl) {
+        (egui::Key::C, true) => Some(egui::Event::Copy),
+        (egui::Key::X, true) => Some(egui::Event::Cut),
+        (egui::Key::V, true) => {
+            // todo: implement paste
+            None 
+        },
+        _ => None,
+    };
 
-fn is_cut(key: egui::Key, modifiers: Modifiers) -> bool {
-    key == egui::Key::X && modifiers.ctrl
-}
+    if let Some(event) = event {
+        egui_input.events.push(event);
+        return true;
+    }
 
-fn is_paste(key: egui::Key, modifiers: Modifiers) -> bool {
-    key == egui::Key::V && modifiers.ctrl
+    false
 }
-
 
 pub fn handle_key_press(event: KeyEvent, pressed: bool, egui_input: &mut RawInput) {
-
     if let Some(key) = keysym_to_egui_key(event.keysym) {
-        if is_copy(key, egui_input.modifiers) {
-            egui_input.events.push(egui::Event::Copy);
-            return
-        } else if is_cut(key, egui_input.modifiers) {
-            egui_input.events.push(egui::Event::Cut);
-            return
-        } else if is_paste(key, egui_input.modifiers) {
-            //egui_input.events.push(egui::Event::Paste);
+        if pressed && handle_clipboard_shortcuts(key, egui_input.modifiers, egui_input) {
+            return;
         }
 
-        let key = egui::Event::Key {
+        let key_event = egui::Event::Key {
             physical_key: None,
             repeat: false, // seems to be just handled by egui
-            key: key,
-            pressed: pressed,
+            key,
+            pressed,
             modifiers: egui_input.modifiers,
         };
 
-        egui_input.events.push(key);
+        egui_input.events.push(key_event);
     }
 
     if let Some(utf8_string) = event.utf8 {
@@ -46,7 +45,6 @@ pub fn handle_key_press(event: KeyEvent, pressed: bool, egui_input: &mut RawInpu
 }
 
 fn keysym_to_egui_key(keysym: Keysym) -> Option<egui::Key> {
-
     match keysym {
         Keysym::Down => Some(egui::Key::ArrowDown),
         Keysym::Left => Some(egui::Key::ArrowLeft),
