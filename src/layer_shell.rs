@@ -1,6 +1,10 @@
+use std::{
+    sync::{Arc, RwLock},
+    time::Instant,
+};
+
 use egui::{PointerButton, Shadow};
 use egui_wgpu::ScreenDescriptor;
-use layer_shell_wgpu_egui::wgpu_state::WgpuState;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
@@ -10,11 +14,7 @@ use smithay_client_toolkit::{
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
-        pointer::{
-            PointerEvent,
-            PointerEventKind::{self},
-            PointerHandler,
-        },
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
         Capability, SeatHandler, SeatState,
     },
     shell::{
@@ -25,83 +25,50 @@ use smithay_client_toolkit::{
         WaylandSurface,
     },
 };
-use std::{
-    sync::{Arc, RwLock},
-    time::Instant,
-};
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_output, wl_pointer, wl_seat, wl_surface},
     Connection, QueueHandle,
 };
 
-fn main() {
-    env_logger::init();
-    let mut event_loop: EventLoop<LayerShellWgpuEgui> =
-        EventLoop::try_new().expect("Could not create event loop.");
-    let mut wgpu = LayerShellWgpuEgui::new(&event_loop);
+use crate::{egui_state, wgpu_state::WgpuState};
 
-    loop {
-        let timeout = match *wgpu.redraw_at.read().unwrap() {
-            Some(instant) => {
-                if wgpu.can_draw {
-                    Some(instant.duration_since(Instant::now()))
-                } else {
-                    None
-                }
-            }
-            None => None,
-        };
-
-        event_loop.dispatch(timeout, &mut wgpu).unwrap();
-        if wgpu.should_draw() {
-            wgpu.draw();
-        }
-
-        if wgpu.exit {
-            println!("exiting example");
-            break;
-        }
-    }
-
-    drop(wgpu.wgpu_state.surface);
-    drop(wgpu.layer);
+#[derive(Default)]
+pub struct LayerShellOptions {
+    pub something: u32,
 }
 
-struct LayerShellWgpuEgui {
+pub struct WgpuLayerShellState {
     registry_state: RegistryState,
     seat_state: SeatState,
     output_state: OutputState,
+    queue_handle: Arc<QueueHandle<WgpuLayerShellState>>,
 
-    exit: bool,
     layer: LayerSurface,
-
-    egui_state: layer_shell_wgpu_egui::egui_state::State,
-
-    first_configure: bool,
-
     pointer: Option<wl_pointer::WlPointer>,
 
-    name: String,
+    wgpu_state: WgpuState,
+    egui_state: egui_state::State,
 
-    can_draw: bool,
+    pub can_draw: bool,
     has_events: bool,
 
-    redraw_at: Arc<RwLock<Option<Instant>>>,
+    pub redraw_at: Arc<RwLock<Option<Instant>>>,
 
-    wgpu_state: WgpuState,
+    first_configure: bool,
+    pub exit: bool,
 
-    queue_handle: Arc<QueueHandle<LayerShellWgpuEgui>>,
+    name: String,
 }
 
-impl LayerShellWgpuEgui {
+impl WgpuLayerShellState {
     pub fn new(event_loop: &EventLoop<Self>) -> Self {
         let initial_width = 600;
         let initial_height = 300;
 
         let connection = Connection::connect_to_env().unwrap();
         let (global_list, event_queue) = registry_queue_init(&connection).unwrap();
-        let queue_handle: Arc<QueueHandle<LayerShellWgpuEgui>> = Arc::new(event_queue.handle());
+        let queue_handle: Arc<QueueHandle<WgpuLayerShellState>> = Arc::new(event_queue.handle());
 
         WaylandSource::new(connection.clone(), event_queue)
             .insert(event_loop.handle())
@@ -140,16 +107,15 @@ impl LayerShellWgpuEgui {
             }
         });
 
-        let egui_state = layer_shell_wgpu_egui::egui_state::State::new(
+        let egui_state = egui_state::State::new(
             egui_context,
-            egui::viewport::ViewportId::ROOT,
             &wgpu_state.device,
             wgpu_state.surface_configuration.format,
             None,
             1,
         );
 
-        LayerShellWgpuEgui {
+        WgpuLayerShellState {
             registry_state: RegistryState::new(&global_list),
             seat_state: SeatState::new(&global_list, &queue_handle),
             output_state: OutputState::new(&global_list, &queue_handle),
@@ -273,7 +239,47 @@ impl LayerShellWgpuEgui {
     }
 }
 
-impl CompositorHandler for LayerShellWgpuEgui {
+delegate_registry!(WgpuLayerShellState);
+impl ProvidesRegistryState for WgpuLayerShellState {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
+    }
+    registry_handlers![OutputState];
+}
+
+delegate_output!(WgpuLayerShellState);
+impl OutputHandler for WgpuLayerShellState {
+    fn output_state(&mut self) -> &mut OutputState {
+        &mut self.output_state
+    }
+
+    fn new_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+
+    fn update_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+
+    fn output_destroyed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+}
+
+delegate_compositor!(WgpuLayerShellState);
+impl CompositorHandler for WgpuLayerShellState {
     fn scale_factor_changed(
         &mut self,
         _conn: &Connection,
@@ -321,37 +327,30 @@ impl CompositorHandler for LayerShellWgpuEgui {
     }
 }
 
-impl OutputHandler for LayerShellWgpuEgui {
-    fn output_state(&mut self) -> &mut OutputState {
-        &mut self.output_state
+delegate_layer!(WgpuLayerShellState);
+impl LayerShellHandler for WgpuLayerShellState {
+    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
+        self.exit = true;
     }
 
-    fn new_output(
+    fn configure(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
+        _layer: &LayerSurface,
+        _configure: LayerSurfaceConfigure,
+        _serial: u32,
     ) {
-    }
-
-    fn update_output(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
-    ) {
-    }
-
-    fn output_destroyed(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
-    ) {
+        if self.first_configure {
+            self.first_configure = false;
+            //self.draw(qh);
+            self.can_draw = true;
+        }
     }
 }
 
-impl SeatHandler for LayerShellWgpuEgui {
+delegate_seat!(WgpuLayerShellState);
+impl SeatHandler for WgpuLayerShellState {
     fn seat_state(&mut self) -> &mut SeatState {
         &mut self.seat_state
     }
@@ -389,46 +388,9 @@ impl SeatHandler for LayerShellWgpuEgui {
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
 }
 
-delegate_compositor!(LayerShellWgpuEgui);
-delegate_output!(LayerShellWgpuEgui);
+delegate_pointer!(WgpuLayerShellState);
 
-delegate_seat!(LayerShellWgpuEgui);
-
-delegate_registry!(LayerShellWgpuEgui);
-
-delegate_layer!(LayerShellWgpuEgui);
-
-impl ProvidesRegistryState for LayerShellWgpuEgui {
-    fn registry(&mut self) -> &mut RegistryState {
-        &mut self.registry_state
-    }
-    registry_handlers![OutputState];
-}
-
-impl LayerShellHandler for LayerShellWgpuEgui {
-    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
-        self.exit = true;
-    }
-
-    fn configure(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _layer: &LayerSurface,
-        _configure: LayerSurfaceConfigure,
-        _serial: u32,
-    ) {
-        if self.first_configure {
-            self.first_configure = false;
-            //self.draw(qh);
-            self.can_draw = true;
-        }
-    }
-}
-
-delegate_pointer!(LayerShellWgpuEgui);
-
-impl PointerHandler for LayerShellWgpuEgui {
+impl PointerHandler for WgpuLayerShellState {
     fn pointer_frame(
         &mut self,
         _: &Connection,

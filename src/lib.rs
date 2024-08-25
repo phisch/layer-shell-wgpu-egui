@@ -1,6 +1,11 @@
+use application::WgpuLayerShellApp;
+use layer_shell::LayerShellOptions;
+
+pub mod application;
 pub mod egui_state;
 pub mod error;
 pub mod keys;
+pub mod layer_shell;
 pub mod wgpu_state;
 
 #[derive(Debug)]
@@ -13,11 +18,6 @@ pub enum Error {
 pub type Result<T = (), E = Error> = std::result::Result<T, E>;
 
 pub type AppCreator = Box<dyn FnOnce(&egui::Context) -> Result<Box<dyn App>, Error>>;
-
-#[derive(Default)]
-pub struct LayerShellOptions {
-    pub something: u32,
-}
 
 pub trait App {
     fn update(&mut self, ctx: &egui::Context);
@@ -33,9 +33,9 @@ pub trait App {
 }
 
 pub fn run_layer(options: LayerShellOptions, app_creator: AppCreator) -> Result {
-    //let app = WgpuLayerShellApp::new(options, app);
-    //app.run()
-    Ok(())
+    let mut app = WgpuLayerShellApp::new(options, app_creator);
+
+    app.run()
 }
 
 pub fn run_layer_simple(

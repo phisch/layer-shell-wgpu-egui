@@ -1,9 +1,14 @@
 use egui::{Context, FullOutput};
-use egui_wgpu::{wgpu::{CommandEncoder, Device, LoadOp, Operations, Queue, RenderPassColorAttachment, RenderPassDescriptor, StoreOp, TextureFormat, TextureView}, Renderer, ScreenDescriptor};
+use egui_wgpu::{
+    wgpu::{
+        CommandEncoder, Device, LoadOp, Operations, Queue, RenderPassColorAttachment,
+        RenderPassDescriptor, StoreOp, TextureFormat, TextureView,
+    },
+    Renderer, ScreenDescriptor,
+};
 
 pub struct State {
     context: egui::Context,
-    viewport_id: egui::ViewportId,
     input: egui::RawInput,
     renderer: Renderer,
     start_time: std::time::Instant,
@@ -12,11 +17,10 @@ pub struct State {
 impl State {
     pub fn new(
         context: egui::Context,
-        viewport_id: egui::ViewportId,
         device: &Device,
         output_color_format: TextureFormat,
         output_depth_format: Option<TextureFormat>,
-        msaa_samples: u32
+        msaa_samples: u32,
     ) -> Self {
         let input = egui::RawInput {
             focused: true,
@@ -40,15 +44,14 @@ impl State {
             msaa_samples,
         );
 
-        /* input
-            .viewports
-            .entry(egui::ViewportId::ROOT)
-            .or_default()
-            .native_pixels_per_point = Some(1.0); */
+        // input
+        //     .viewports
+        //     .entry(egui::ViewportId::ROOT)
+        //     .or_default()
+        //     .native_pixels_per_point = Some(1.0);
 
         Self {
             context,
-            viewport_id,
             input,
             renderer,
             start_time: std::time::Instant::now(),
@@ -71,7 +74,6 @@ impl State {
         self.input.events.push(event);
     }
 
-
     pub fn process_events(&mut self, run_ui: impl FnOnce(&Context)) -> FullOutput {
         // TODO: maybe we need to take input for a certain window / surface?
         self.input.time = Some(self.start_time.elapsed().as_secs_f64());
@@ -93,7 +95,6 @@ impl State {
         full_output: FullOutput,
     ) {
         //self.context.set_pixels_per_point(screen_descriptor.pixels_per_point);
-
 
         // iterate over viewport outputs
         /* for output in full_output.viewport_output.values() {
