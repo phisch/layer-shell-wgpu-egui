@@ -1,9 +1,13 @@
 use layer_shell_wgpu_egui::layer_shell::LayerShellOptions;
+use smithay_client_toolkit::shell::wlr_layer::{Anchor, KeyboardInteractivity};
 
 fn main() -> layer_shell_wgpu_egui::Result {
     env_logger::init();
 
     let options = LayerShellOptions {
+        height: 100,
+        anchor: Some(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT),
+        keyboard_interactivity: Some(KeyboardInteractivity::OnDemand),
         ..Default::default()
     };
 

@@ -4,16 +4,18 @@ fn main() -> layer_shell_wgpu_egui::Result {
     env_logger::init();
 
     let options = LayerShellOptions {
+        width: 500,
+        height: 300,
         ..Default::default()
     };
 
     // application state
-    let mut name = "Arthur".to_owned();
-    let mut age = 42;
+    let mut name = "Alice".to_owned();
+    let mut age = 26;
 
     layer_shell_wgpu_egui::run_layer_simple(options, move |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("My egui Layer");
+            ui.heading("Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.");
             ui.horizontal(|ui| {
                 let name_label = ui.label("Your name: ");
                 ui.text_edit_singleline(&mut name)
