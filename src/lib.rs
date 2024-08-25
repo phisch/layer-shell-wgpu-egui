@@ -1,13 +1,7 @@
-pub mod error;
-pub mod wgpu_state;
-
-use wayland_client::Connection;
-
-//pub mod egui_renderer;
 pub mod egui_state;
-
+pub mod error;
 pub mod keys;
-
+pub mod wgpu_state;
 
 #[derive(Debug)]
 pub enum Error {
@@ -18,13 +12,14 @@ pub enum Error {
 /// Short for `Result<T, eframe::Error>`.
 pub type Result<T = (), E = Error> = std::result::Result<T, E>;
 
+pub type AppCreator = Box<dyn FnOnce(&egui::Context) -> Result<Box<dyn App>, Error>>;
+
 #[derive(Default)]
 pub struct LayerShellOptions {
     pub something: u32,
 }
 
 pub trait App {
-
     fn update(&mut self, ctx: &egui::Context);
 
     // fn save(&mut self, _storage: &mut dyn Storage) {}
@@ -37,38 +32,28 @@ pub trait App {
     // }
 }
 
-struct WgpuLayerShellApp {
-    layer_shell_options: LayerShellOptions,
-    app: Box<dyn App>,
+pub fn run_layer(options: LayerShellOptions, app_creator: AppCreator) -> Result {
+    //let app = WgpuLayerShellApp::new(options, app);
+    //app.run()
+    Ok(())
 }
 
-impl WgpuLayerShellApp {
-    pub fn new(layer_shell_options: LayerShellOptions, app: impl App + 'static) -> Self {
+pub fn run_layer_simple(
+    options: LayerShellOptions,
+    update_fun: impl FnMut(&egui::Context) + 'static,
+) -> Result {
+    struct SimpleLayerWrapper<U> {
+        update_fun: U,
+    }
 
-        //let connection = Connection::connect_to_env();
-
-
-
-
-
-
-
-        Self {
-            layer_shell_options,
-            app: Box::new(app),
+    impl<U: FnMut(&egui::Context) + 'static> App for SimpleLayerWrapper<U> {
+        fn update(&mut self, ctx: &egui::Context) {
+            (self.update_fun)(ctx);
         }
     }
 
-    pub fn run(self) -> Result {
-        Ok(())
-    }
-}
-
-
-pub fn run_layer_shell(
-    options: LayerShellOptions,
-    app: impl App + 'static,
-) -> Result {
-    let app = WgpuLayerShellApp::new(options, app);
-    app.run()
+    run_layer(
+        options,
+        Box::new(|_| Ok(Box::new(SimpleLayerWrapper { update_fun }))),
+    )
 }
