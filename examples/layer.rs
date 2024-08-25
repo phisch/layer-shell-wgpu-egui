@@ -1,12 +1,20 @@
+use layer_shell_wgpu_egui::layer_shell::LayerShellOptions;
+
 fn main() -> layer_shell_wgpu_egui::Result {
     env_logger::init();
 
-    let options = layer_shell_wgpu_egui::LayerShellOptions {
+    let options = LayerShellOptions {
         ..Default::default()
     };
 
-    //egui_sctk::run_layer_shell(options, Ok(Box::<MyApp>::default()))
-    Ok(())
+    layer_shell_wgpu_egui::run_layer(
+        options,
+        Box::new(|egui_context| {
+            // This gives us image support:
+            egui_extras::install_image_loaders(&egui_context);
+            Ok(Box::<MyApp>::default())
+        }),
+    )
 }
 
 #[derive(Default)]
