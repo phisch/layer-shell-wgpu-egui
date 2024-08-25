@@ -27,10 +27,10 @@ pub enum WgpuStateError {
 }
 
 pub struct WgpuState {
-    pub device: Device,
-    pub surface_configuration: SurfaceConfiguration,
-    pub queue: Queue,
-    pub surface: Surface<'static>,
+    pub(crate) device: Device,
+    pub(crate) surface_configuration: SurfaceConfiguration,
+    pub(crate) queue: Queue,
+    pub(crate) surface: Surface<'static>,
 }
 
 impl WgpuState {
@@ -77,8 +77,8 @@ impl WgpuState {
         let surface_configuration = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
             format: *texture_format,
-            width: 600,
-            height: 300,
+            width: 1,
+            height: 1,
             present_mode: PresentMode::Mailbox,
             desired_maximum_frame_latency: 2,
             alpha_mode: egui_wgpu::wgpu::CompositeAlphaMode::PreMultiplied,
@@ -93,5 +93,12 @@ impl WgpuState {
             queue,
             surface,
         })
+    }
+
+    pub(crate) fn resize(&mut self, width: u32, height: u32) {
+        self.surface_configuration.width = width;
+        self.surface_configuration.height = height;
+        self.surface
+            .configure(&self.device, &self.surface_configuration);
     }
 }

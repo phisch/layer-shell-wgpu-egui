@@ -1,9 +1,9 @@
 use std::{
     sync::{Arc, RwLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-use egui::{PointerButton, Shadow};
+use egui::PointerButton;
 use egui_wgpu::ScreenDescriptor;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -31,41 +31,44 @@ use wayland_client::{
     Connection, QueueHandle,
 };
 
-use crate::{egui_state, wgpu_state::WgpuState};
+use crate::{
+    egui_state::{self},
+    wgpu_state::WgpuState,
+    App,
+};
 
 #[derive(Default)]
 pub struct LayerShellOptions {
-    pub something: u32,
+    pub layer: Option<Layer>,
+    pub namespace: String,
+    pub width: u32,
+    pub height: u32,
+    pub anchor: Option<Anchor>,
+    pub keyboard_interactivity: Option<KeyboardInteractivity>,
 }
 
-pub struct WgpuLayerShellState {
+pub(crate) struct WgpuLayerShellState {
     registry_state: RegistryState,
     seat_state: SeatState,
     output_state: OutputState,
-    queue_handle: Arc<QueueHandle<WgpuLayerShellState>>,
+    pub(crate) queue_handle: Arc<QueueHandle<WgpuLayerShellState>>,
 
-    layer: LayerSurface,
+    pub(crate) layer: LayerSurface,
     pointer: Option<wl_pointer::WlPointer>,
 
-    wgpu_state: WgpuState,
-    egui_state: egui_state::State,
+    pub(crate) can_draw: bool,
+    pub(crate) has_events: bool,
 
-    pub can_draw: bool,
-    has_events: bool,
+    is_configured: bool,
+    pub(crate) exit: bool,
 
-    pub redraw_at: Arc<RwLock<Option<Instant>>>,
-
-    first_configure: bool,
-    pub exit: bool,
-
-    name: String,
+    pub(crate) wgpu_state: WgpuState,
+    pub(crate) egui_state: egui_state::State,
+    pub(crate) redraw_at: Arc<RwLock<Option<Instant>>>,
 }
 
 impl WgpuLayerShellState {
-    pub fn new(event_loop: &EventLoop<Self>) -> Self {
-        let initial_width = 600;
-        let initial_height = 300;
-
+    pub(crate) fn new(event_loop: &EventLoop<Self>, options: LayerShellOptions) -> Self {
         let connection = Connection::connect_to_env().unwrap();
         let (global_list, event_queue) = registry_queue_init(&connection).unwrap();
         let queue_handle: Arc<QueueHandle<WgpuLayerShellState>> = Arc::new(event_queue.handle());
@@ -84,16 +87,21 @@ impl WgpuLayerShellState {
         let layer_surface = layer_shell.create_layer_surface(
             &queue_handle,
             wl_surface,
-            Layer::Top,
-            Some("wgpu_egui_layer"),
+            options.layer.unwrap_or(Layer::Top),
+            Some(options.namespace),
             None,
         );
-        layer_surface.set_anchor(Anchor::TOP);
-        layer_surface.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
-        layer_surface.set_size(initial_width, initial_height);
+        if let Some(anchor) = options.anchor {
+            layer_surface.set_anchor(anchor);
+        }
+        if let Some(keyboard_interactivity) = options.keyboard_interactivity {
+            layer_surface.set_keyboard_interactivity(keyboard_interactivity);
+        }
+        layer_surface.set_size(options.width, options.height);
         layer_surface.commit();
 
-        let wgpu_state = WgpuState::new(&connection.backend(), layer_surface.wl_surface()).unwrap();
+        let wgpu_state = WgpuState::new(&connection.backend(), layer_surface.wl_surface())
+            .expect("Could not create wgpu state");
 
         let egui_context = egui::Context::default();
 
@@ -123,22 +131,21 @@ impl WgpuLayerShellState {
             exit: false,
             layer: layer_surface,
 
-            egui_state,
-
-            first_configure: true,
+            is_configured: false,
 
             pointer: None,
-            name: "foo".to_string(),
 
             can_draw: false,
             has_events: true,
-            wgpu_state,
             queue_handle,
+
+            egui_state,
+            wgpu_state,
             redraw_at,
         }
     }
 
-    pub fn should_draw(&self) -> bool {
+    pub(crate) fn should_draw(&self) -> bool {
         if !self.can_draw {
             return false;
         }
@@ -153,50 +160,27 @@ impl WgpuLayerShellState {
         }
     }
 
-    pub fn draw(&mut self) {
+    pub(crate) fn get_timeout(&self) -> Option<Duration> {
+        match *self.redraw_at.read().unwrap() {
+            Some(instant) => {
+                if self.can_draw {
+                    Some(instant.duration_since(Instant::now()))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    }
+
+    pub(crate) fn draw(&mut self, application: &mut dyn App) {
         *self.redraw_at.write().unwrap() = None;
         self.can_draw = false;
         self.has_events = false;
 
-        let full_output = self.egui_state.process_events(
-            |ctx| {
-                let my_frame = egui::containers::Frame {
-                    // #0A0A0A
-                    fill: egui::Color32::from_rgba_premultiplied(10, 10, 10, 180),
-                    inner_margin: egui::Margin::same(15f32),
-                    outer_margin: egui::Margin::same(15f32),
-                    rounding: egui::Rounding::same(8f32),
-                    shadow: Shadow {
-                        offset: egui::vec2(0f32, 0f32),
-                        blur: 10f32,
-                        spread: 5f32,
-                        color: egui::Color32::from_rgba_premultiplied(0, 0, 0, 128),
-                    },
-                    ..Default::default()
-                };
-
-                egui::CentralPanel::default()
-                .frame(my_frame)
-                .show(ctx, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.label(
-                            egui::widget_text::RichText::new("This is a sctk layer shell rendering an egui application with wgpu!")
-                                .color(egui::Color32::WHITE),
-                        );
-                    });
-                    ui.add(egui::widgets::Button::new("Click me!"));
-
-                    ui.text_edit_singleline(&mut self.name);
-
-                    // ui.add(
-                    //     egui::widgets::ProgressBar::new(0.5)
-                    //         .show_percentage()
-                    //         .animate(true)
-                    //         .text("Progress bar to show an animation"),
-                    // );
-                });
-            },
-        );
+        let full_output = self
+            .egui_state
+            .process_events(|ctx| application.update(ctx));
 
         let surface_texture = self
             .wgpu_state
@@ -227,7 +211,8 @@ impl WgpuLayerShellState {
             &mut encoder,
             &surface_view,
             screen_descriptor,
-            full_output,
+            full_output.shapes,
+            full_output.textures_delta,
         );
         self.wgpu_state.queue.submit(Some(encoder.finish()));
 
@@ -338,14 +323,19 @@ impl LayerShellHandler for WgpuLayerShellState {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _layer: &LayerSurface,
-        _configure: LayerSurfaceConfigure,
+        configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        if self.first_configure {
-            self.first_configure = false;
-            //self.draw(qh);
+        if !self.is_configured {
+            self.is_configured = true;
             self.can_draw = true;
         }
+
+        self.wgpu_state
+            .resize(configure.new_size.0, configure.new_size.1);
+
+        self.egui_state
+            .set_size(configure.new_size.0, configure.new_size.1);
     }
 }
 

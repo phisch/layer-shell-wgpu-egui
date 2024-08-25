@@ -1,4 +1,4 @@
-use egui::{Context, FullOutput};
+use egui::{epaint::ClippedShape, Context, FullOutput, TexturesDelta};
 use egui_wgpu::{
     wgpu::{
         CommandEncoder, Device, LoadOp, Operations, Queue, RenderPassColorAttachment,
@@ -24,15 +24,6 @@ impl State {
     ) -> Self {
         let input = egui::RawInput {
             focused: true,
-            screen_rect: Some({
-                egui::Rect {
-                    min: egui::Pos2 { x: 0f32, y: 0f32 },
-                    max: egui::Pos2 {
-                        x: 600 as f32,
-                        y: 300 as f32,
-                    },
-                }
-            }),
             viewport_id: egui::ViewportId::ROOT,
             ..Default::default()
         };
@@ -58,12 +49,19 @@ impl State {
         }
     }
 
-    pub fn context(&self) -> &egui::Context {
-        &self.context
+    pub fn set_size(&mut self, width: u32, height: u32) {
+        let screen_rect = egui::Rect {
+            min: egui::Pos2 { x: 0f32, y: 0f32 },
+            max: egui::Pos2 {
+                x: width as f32,
+                y: height as f32,
+            },
+        };
+        self.input.screen_rect = Some(screen_rect);
     }
 
-    pub fn take_input(&mut self) -> egui::RawInput {
-        return self.input.take();
+    pub fn context(&self) -> &egui::Context {
+        &self.context
     }
 
     pub fn modifiers(&self) -> egui::Modifiers {
@@ -92,7 +90,8 @@ impl State {
         encoder: &mut CommandEncoder,
         window_surface_view: &TextureView,
         screen_descriptor: ScreenDescriptor,
-        full_output: FullOutput,
+        shapes: Vec<ClippedShape>,
+        textures_delta: TexturesDelta,
     ) {
         //self.context.set_pixels_per_point(screen_descriptor.pixels_per_point);
 
@@ -109,8 +108,8 @@ impl State {
 
         let tris = self
             .context
-            .tessellate(full_output.shapes, self.context.pixels_per_point());
-        for (id, image_delta) in &full_output.textures_delta.set {
+            .tessellate(shapes, self.context.pixels_per_point());
+        for (id, image_delta) in &textures_delta.set {
             self.renderer
                 .update_texture(device, queue, *id, image_delta);
         }
@@ -132,7 +131,7 @@ impl State {
         });
         self.renderer.render(&mut rpass, &tris, &screen_descriptor);
         drop(rpass);
-        for x in &full_output.textures_delta.free {
+        for x in &textures_delta.free {
             self.renderer.free_texture(x)
         }
     }

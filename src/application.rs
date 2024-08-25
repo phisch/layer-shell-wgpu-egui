@@ -1,50 +1,52 @@
-use std::time::Instant;
+use std::{
+    cell::RefCell,
+    time::{Duration, Instant},
+};
 
 use smithay_client_toolkit::reexports::calloop::EventLoop;
 
 use crate::{
     layer_shell::{LayerShellOptions, WgpuLayerShellState},
-    AppCreator, Result,
+    App, AppCreator, Result,
 };
 
 pub struct WgpuLayerShellApp {
-    wgpu_layer_shell_state: WgpuLayerShellState,
+    application: RefCell<Box<dyn App>>,
     event_loop: EventLoop<'static, WgpuLayerShellState>,
+    layer_shell_state: WgpuLayerShellState,
 }
 
 impl WgpuLayerShellApp {
-    pub fn new(_layer_shell_options: LayerShellOptions, _app_creator: AppCreator) -> Self {
+    pub fn new(layer_shell_options: LayerShellOptions, app_creator: AppCreator) -> Self {
         let event_loop: EventLoop<WgpuLayerShellState> =
             EventLoop::try_new().expect("Could not create event loop.");
-        let wgpu = WgpuLayerShellState::new(&event_loop);
+        let layer_shell_state = WgpuLayerShellState::new(&event_loop, layer_shell_options);
+
         Self {
-            wgpu_layer_shell_state: wgpu,
+            // TODO: find better way to handle this potential error
+            application: RefCell::new(
+                app_creator(&layer_shell_state.egui_state.context()).expect("could not create app"),
+            ),
             event_loop,
+            layer_shell_state,
         }
     }
 
     pub fn run(&mut self) -> Result {
         loop {
-            let timeout = match *self.wgpu_layer_shell_state.redraw_at.read().unwrap() {
-                Some(instant) => {
-                    if self.wgpu_layer_shell_state.can_draw {
-                        Some(instant.duration_since(Instant::now()))
-                    } else {
-                        None
-                    }
-                }
-                None => None,
-            };
-
             self.event_loop
-                .dispatch(timeout, &mut self.wgpu_layer_shell_state)
+                .dispatch(
+                    self.layer_shell_state.get_timeout(),
+                    &mut self.layer_shell_state,
+                )
                 .unwrap();
 
-            if self.wgpu_layer_shell_state.should_draw() {
-                self.wgpu_layer_shell_state.draw();
+            if self.layer_shell_state.should_draw() {
+                let mut application = self.application.borrow_mut();
+                self.layer_shell_state.draw(&mut **application);
             }
 
-            if self.wgpu_layer_shell_state.exit {
+            if self.layer_shell_state.exit {
                 println!("exiting example");
                 break;
             }

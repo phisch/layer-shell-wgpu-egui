@@ -1,12 +1,12 @@
 use application::WgpuLayerShellApp;
 use layer_shell::LayerShellOptions;
 
-pub mod application;
-pub mod egui_state;
+pub(crate) mod application;
+pub(crate) mod egui_state;
 pub mod error;
-pub mod keys;
+pub(crate) mod keys;
 pub mod layer_shell;
-pub mod wgpu_state;
+pub(crate) mod wgpu_state;
 
 #[derive(Debug)]
 pub enum Error {
