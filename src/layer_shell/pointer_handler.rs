@@ -3,7 +3,10 @@ use smithay_client_toolkit::{
     delegate_pointer,
     seat::pointer::{PointerEvent, PointerEventKind, PointerHandler},
 };
-use wayland_client::{protocol::wl_pointer, Connection, QueueHandle};
+use wayland_client::{
+    protocol::wl_pointer::{self},
+    Connection, QueueHandle,
+};
 
 use super::WgpuLayerShellState;
 
@@ -18,35 +21,20 @@ impl PointerHandler for WgpuLayerShellState {
         events: &[PointerEvent],
     ) {
         for event in events {
+            let position = egui::pos2(event.position.0 as f32, event.position.1 as f32);
             let egui_event = match event.kind {
-                PointerEventKind::Enter { .. } => egui::Event::PointerMoved(egui::pos2(
-                    event.position.0 as f32,
-                    event.position.1 as f32,
-                )),
-                PointerEventKind::Leave { .. } => egui::Event::PointerGone,
-                PointerEventKind::Motion { .. } => egui::Event::PointerMoved(egui::pos2(
-                    event.position.0 as f32,
-                    event.position.1 as f32,
-                )),
-                PointerEventKind::Press { button, .. } => {
-                    if let Some(button) = translate_button(button) {
-                        egui::Event::PointerButton {
-                            button,
-                            modifiers: self.egui_state.modifiers(),
-                            pos: egui::pos2(event.position.0 as f32, event.position.1 as f32),
-                            pressed: true,
-                        }
-                    } else {
-                        continue;
-                    }
+                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                    egui::Event::PointerMoved(position)
                 }
-                PointerEventKind::Release { button, .. } => {
+                PointerEventKind::Leave { .. } => egui::Event::PointerGone,
+                PointerEventKind::Press { button, .. }
+                | PointerEventKind::Release { button, .. } => {
                     if let Some(button) = translate_button(button) {
                         egui::Event::PointerButton {
                             button,
                             modifiers: self.egui_state.modifiers(),
-                            pos: egui::pos2(event.position.0 as f32, event.position.1 as f32),
-                            pressed: false,
+                            pos: position,
+                            pressed: matches!(event.kind, PointerEventKind::Press { .. }),
                         }
                     } else {
                         continue;
@@ -54,7 +42,6 @@ impl PointerHandler for WgpuLayerShellState {
                 }
                 _ => continue,
             };
-
             self.egui_state.push_event(egui_event);
         }
     }

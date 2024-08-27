@@ -10,7 +10,7 @@ This is an **early and work in progress** repository working on a layer shell ba
 This is a likely incomplete list of things that need to be done:
 
 - [x] keyboard input
-- [ ] mouse button input
+- [x] mouse button input
 - [ ] scroll support
 - [ ] clipboard, copy/cut/paste
 - [ ] fractional scaling
@@ -19,5 +19,7 @@ This is a likely incomplete list of things that need to be done:
 - [ ] touch input
 - [ ] drag and drop
 - [ ] touchpad gestures (pinch to zoom, etc)
+- [ ] egui image loaders
+- [ ] cursor shape protocol
 
 The code is also in a really dirty state, it'll take some time to clean it up and find a good way to structure and abstract over things.
