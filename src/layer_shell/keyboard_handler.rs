@@ -75,8 +75,8 @@ impl KeyboardHandler for WgpuLayerShellState {
             alt: modifiers.alt,
             ctrl: modifiers.ctrl,
             shift: modifiers.shift,
-            mac_cmd: modifiers.logo,
-            command: modifiers.logo,
+            mac_cmd: false, // this is linux only
+            command: modifiers.ctrl,
         };
     }
 }

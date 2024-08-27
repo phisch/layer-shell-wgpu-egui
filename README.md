@@ -9,7 +9,7 @@ This is an **early and work in progress** repository working on a layer shell ba
 
 This is a likely incomplete list of things that need to be done:
 
-- [ ] keyboard input (implemented, but not wired up)
+- [x] keyboard input
 - [ ] mouse button input
 - [ ] scroll support
 - [ ] clipboard, copy/cut/paste
