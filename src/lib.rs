@@ -4,7 +4,6 @@ use layer_shell::LayerShellOptions;
 pub(crate) mod application;
 pub(crate) mod egui_state;
 pub mod error;
-pub(crate) mod keys;
 pub mod layer_shell;
 pub(crate) mod wgpu_state;
 

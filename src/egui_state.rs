@@ -60,6 +60,10 @@ impl State {
         self.input.screen_rect = Some(screen_rect);
     }
 
+    pub(crate) fn input(&mut self) -> &mut egui::RawInput {
+        &mut self.input
+    }
+
     pub fn context(&self) -> &egui::Context {
         &self.context
     }

@@ -1,14 +1,98 @@
 use egui::{Modifiers, RawInput};
-use smithay_client_toolkit::seat::keyboard::{KeyEvent, Keysym};
+use smithay_client_toolkit::{
+    delegate_keyboard,
+    seat::keyboard::{KeyEvent, KeyboardHandler, Keysym},
+};
+use wayland_client::{protocol::wl_surface, Connection, QueueHandle};
 
-fn handle_clipboard_shortcuts(key: egui::Key, modifiers: Modifiers, egui_input: &mut RawInput) -> bool {
+use super::WgpuLayerShellState;
+
+delegate_keyboard!(WgpuLayerShellState);
+
+impl KeyboardHandler for WgpuLayerShellState {
+    fn enter(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wayland_client::protocol::wl_keyboard::WlKeyboard,
+        _surface: &wl_surface::WlSurface,
+        _serial: u32,
+        _raw: &[u32],
+        _keysyms: &[smithay_client_toolkit::seat::keyboard::Keysym],
+    ) {
+        let input = self.egui_state.input();
+        input.focused = true;
+        // todo: this should probably be in surface enter?
+        input.events.push(egui::Event::WindowFocused(true));
+    }
+
+    fn leave(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wayland_client::protocol::wl_keyboard::WlKeyboard,
+        _surface: &wl_surface::WlSurface,
+        _serial: u32,
+    ) {
+        let input = self.egui_state.input();
+        input.focused = false;
+        // todo: this should probably be in surface enter?
+        input.events.push(egui::Event::WindowFocused(false));
+    }
+
+    fn press_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wayland_client::protocol::wl_keyboard::WlKeyboard,
+        _serial: u32,
+        event: smithay_client_toolkit::seat::keyboard::KeyEvent,
+    ) {
+        handle_key_press(event, true, self.egui_state.input());
+    }
+
+    fn release_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wayland_client::protocol::wl_keyboard::WlKeyboard,
+        _serial: u32,
+        event: smithay_client_toolkit::seat::keyboard::KeyEvent,
+    ) {
+        handle_key_press(event, false, self.egui_state.input());
+    }
+
+    fn update_modifiers(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wayland_client::protocol::wl_keyboard::WlKeyboard,
+        _serial: u32,
+        modifiers: smithay_client_toolkit::seat::keyboard::Modifiers,
+        _layout: u32,
+    ) {
+        self.egui_state.input().modifiers = Modifiers {
+            alt: modifiers.alt,
+            ctrl: modifiers.ctrl,
+            shift: modifiers.shift,
+            mac_cmd: modifiers.logo,
+            command: modifiers.logo,
+        };
+    }
+}
+
+fn handle_clipboard_shortcuts(
+    key: egui::Key,
+    modifiers: Modifiers,
+    egui_input: &mut RawInput,
+) -> bool {
     let event = match (key, modifiers.ctrl) {
         (egui::Key::C, true) => Some(egui::Event::Copy),
         (egui::Key::X, true) => Some(egui::Event::Cut),
         (egui::Key::V, true) => {
             // todo: implement paste
-            None 
-        },
+            None
+        }
         _ => None,
     };
 

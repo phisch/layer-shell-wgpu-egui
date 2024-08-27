@@ -1,22 +1,21 @@
+mod keyboard_handler;
+mod pointer_handler;
+
 use std::{
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
-use egui::PointerButton;
 use egui_wgpu::ScreenDescriptor;
+use keyboard_handler::handle_key_press;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
-    delegate_seat,
+    delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_seat,
     output::{OutputHandler, OutputState},
-    reexports::{calloop::EventLoop, calloop_wayland_source::WaylandSource},
+    reexports::{calloop::LoopHandle, calloop_wayland_source::WaylandSource},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
-    seat::{
-        pointer::{PointerEvent, PointerEventKind, PointerHandler},
-        Capability, SeatHandler, SeatState,
-    },
+    seat::{Capability, SeatHandler, SeatState},
     shell::{
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
@@ -27,7 +26,7 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_output, wl_pointer, wl_seat, wl_surface},
+    protocol::{wl_keyboard::WlKeyboard, wl_output, wl_pointer::WlPointer, wl_seat, wl_surface},
     Connection, QueueHandle,
 };
 
@@ -48,33 +47,35 @@ pub struct LayerShellOptions {
 }
 
 pub(crate) struct WgpuLayerShellState {
+    //event_loop: Arc<EventLoop<'static, Self>>,
+    loop_handle: LoopHandle<'static, Self>,
     registry_state: RegistryState,
     seat_state: SeatState,
     output_state: OutputState,
-    pub(crate) queue_handle: Arc<QueueHandle<WgpuLayerShellState>>,
+    pub(crate) queue_handle: Arc<QueueHandle<Self>>,
 
     pub(crate) layer: LayerSurface,
-    pointer: Option<wl_pointer::WlPointer>,
+    pointer: Option<WlPointer>,
+    keyboard: Option<WlKeyboard>,
 
-    pub(crate) can_draw: bool,
-    pub(crate) has_events: bool,
-
+    pub(crate) has_frame_callback: bool,
     is_configured: bool,
+
     pub(crate) exit: bool,
 
     pub(crate) wgpu_state: WgpuState,
     pub(crate) egui_state: egui_state::State,
-    pub(crate) redraw_at: Arc<RwLock<Option<Instant>>>,
+    pub(crate) draw_request: Arc<RwLock<Option<Instant>>>,
 }
 
 impl WgpuLayerShellState {
-    pub(crate) fn new(event_loop: &EventLoop<Self>, options: LayerShellOptions) -> Self {
+    pub(crate) fn new(loop_handle: LoopHandle<'static, Self>, options: LayerShellOptions) -> Self {
         let connection = Connection::connect_to_env().unwrap();
         let (global_list, event_queue) = registry_queue_init(&connection).unwrap();
         let queue_handle: Arc<QueueHandle<WgpuLayerShellState>> = Arc::new(event_queue.handle());
 
         WaylandSource::new(connection.clone(), event_queue)
-            .insert(event_loop.handle())
+            .insert(loop_handle.clone())
             .unwrap();
 
         let compositor_state = CompositorState::bind(&global_list, &queue_handle)
@@ -105,13 +106,13 @@ impl WgpuLayerShellState {
 
         let egui_context = egui::Context::default();
 
-        let redraw_at = Arc::new(RwLock::new(None));
+        let draw_request = Arc::new(RwLock::new(None));
 
         egui_context.set_request_repaint_callback({
-            let redraw_at = Arc::clone(&redraw_at);
+            let draw_request = Arc::clone(&draw_request);
             move |info| {
-                let mut redraw_at = redraw_at.write().unwrap();
-                *redraw_at = Some(Instant::now() + info.delay);
+                let mut draw_request = draw_request.write().unwrap();
+                *draw_request = Some(Instant::now() + info.delay);
             }
         });
 
@@ -124,6 +125,7 @@ impl WgpuLayerShellState {
         );
 
         WgpuLayerShellState {
+            loop_handle: loop_handle.clone(),
             registry_state: RegistryState::new(&global_list),
             seat_state: SeatState::new(&global_list, &queue_handle),
             output_state: OutputState::new(&global_list, &queue_handle),
@@ -131,39 +133,41 @@ impl WgpuLayerShellState {
             exit: false,
             layer: layer_surface,
 
+            pointer: None,
+            keyboard: None,
+
+            has_frame_callback: false,
             is_configured: false,
 
-            pointer: None,
-
-            can_draw: false,
-            has_events: true,
             queue_handle,
 
             egui_state,
             wgpu_state,
-            redraw_at,
+            draw_request,
         }
     }
 
-    pub(crate) fn should_draw(&self) -> bool {
-        if !self.can_draw {
+    //fn request_redraw(&self, )
+
+    pub(crate) fn should_draw(&mut self) -> bool {
+        if !self.has_frame_callback {
             return false;
         }
 
-        if self.has_events {
+        if !self.egui_state.input().events.is_empty() {
             return true;
         }
 
-        match *self.redraw_at.read().unwrap() {
+        match *self.draw_request.read().unwrap() {
             Some(time) => time <= Instant::now(),
             None => false,
         }
     }
 
     pub(crate) fn get_timeout(&self) -> Option<Duration> {
-        match *self.redraw_at.read().unwrap() {
+        match *self.draw_request.read().unwrap() {
             Some(instant) => {
-                if self.can_draw {
+                if self.has_frame_callback {
                     Some(instant.duration_since(Instant::now()))
                 } else {
                     None
@@ -174,9 +178,8 @@ impl WgpuLayerShellState {
     }
 
     pub(crate) fn draw(&mut self, application: &mut dyn App) {
-        *self.redraw_at.write().unwrap() = None;
-        self.can_draw = false;
-        self.has_events = false;
+        *self.draw_request.write().unwrap() = None;
+        self.has_frame_callback = false;
 
         let full_output = self
             .egui_state
@@ -290,7 +293,7 @@ impl CompositorHandler for WgpuLayerShellState {
         _surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        self.can_draw = true;
+        self.has_frame_callback = true;
     }
 
     fn surface_enter(
@@ -328,7 +331,8 @@ impl LayerShellHandler for WgpuLayerShellState {
     ) {
         if !self.is_configured {
             self.is_configured = true;
-            self.can_draw = true;
+            self.has_frame_callback = true;
+            *self.draw_request.write().unwrap() = Some(Instant::now());
         }
 
         self.wgpu_state
@@ -354,12 +358,30 @@ impl SeatHandler for WgpuLayerShellState {
         seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
-        if capability == Capability::Pointer && self.pointer.is_none() {
-            let pointer = self
-                .seat_state
-                .get_pointer(qh, &seat)
-                .expect("Failed to create pointer");
-            self.pointer = Some(pointer);
+        match capability {
+            Capability::Pointer if self.pointer.is_none() => {
+                let pointer = self
+                    .seat_state
+                    .get_pointer(qh, &seat)
+                    .expect("Failed to create pointer");
+                self.pointer = Some(pointer);
+            }
+            Capability::Keyboard if self.keyboard.is_none() => {
+                self.keyboard = Some(
+                    self.seat_state
+                        .get_keyboard_with_repeat(
+                            qh,
+                            &seat,
+                            None,
+                            self.loop_handle.clone(),
+                            Box::new(|state, _wl_kbd, event| {
+                                handle_key_press(event, true, &mut state.egui_state.input());
+                            }),
+                        )
+                        .expect("Failed to create keyboard"),
+                );
+            }
+            _ => {}
         }
     }
 
@@ -370,75 +392,20 @@ impl SeatHandler for WgpuLayerShellState {
         _: wl_seat::WlSeat,
         capability: Capability,
     ) {
+        match capability {
+            Capability::Pointer if self.pointer.is_some() => {
+                self.pointer.take().unwrap().release();
+            }
+            Capability::Keyboard if self.keyboard.is_some() => {
+                self.keyboard.take().unwrap().release();
+            }
+            _ => {}
+        }
+
         if capability == Capability::Pointer && self.pointer.is_some() {
             self.pointer.take().unwrap().release();
         }
     }
 
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
-}
-
-delegate_pointer!(WgpuLayerShellState);
-
-impl PointerHandler for WgpuLayerShellState {
-    fn pointer_frame(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_pointer::WlPointer,
-        events: &[PointerEvent],
-    ) {
-        for event in events {
-            let egui_event = match event.kind {
-                PointerEventKind::Enter { .. } => egui::Event::PointerMoved(egui::pos2(
-                    event.position.0 as f32,
-                    event.position.1 as f32,
-                )),
-                PointerEventKind::Leave { .. } => egui::Event::PointerGone,
-                PointerEventKind::Motion { .. } => egui::Event::PointerMoved(egui::pos2(
-                    event.position.0 as f32,
-                    event.position.1 as f32,
-                )),
-                PointerEventKind::Press { button, .. } => {
-                    if let Some(button) = translate_button(button) {
-                        egui::Event::PointerButton {
-                            button,
-                            modifiers: self.egui_state.modifiers(),
-                            pos: egui::pos2(event.position.0 as f32, event.position.1 as f32),
-                            pressed: true,
-                        }
-                    } else {
-                        continue;
-                    }
-                }
-                PointerEventKind::Release { button, .. } => {
-                    if let Some(button) = translate_button(button) {
-                        egui::Event::PointerButton {
-                            button,
-                            modifiers: self.egui_state.modifiers(),
-                            pos: egui::pos2(event.position.0 as f32, event.position.1 as f32),
-                            pressed: false,
-                        }
-                    } else {
-                        continue;
-                    }
-                }
-                _ => continue,
-            };
-
-            self.egui_state.push_event(egui_event);
-            self.has_events = true;
-        }
-    }
-}
-
-fn translate_button(button: u32) -> Option<PointerButton> {
-    match button {
-        0x110 => Some(PointerButton::Primary),
-        0x111 => Some(PointerButton::Secondary),
-        0x112 => Some(PointerButton::Middle),
-        0x113 => Some(PointerButton::Extra1),
-        0x114 => Some(PointerButton::Extra2),
-        _ => None,
-    }
 }

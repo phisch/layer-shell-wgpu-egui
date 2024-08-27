@@ -1,7 +1,4 @@
-use std::{
-    cell::RefCell,
-    time::{Duration, Instant},
-};
+use std::cell::RefCell;
 
 use smithay_client_toolkit::reexports::calloop::EventLoop;
 
@@ -18,9 +15,8 @@ pub struct WgpuLayerShellApp {
 
 impl WgpuLayerShellApp {
     pub fn new(layer_shell_options: LayerShellOptions, app_creator: AppCreator) -> Self {
-        let event_loop: EventLoop<WgpuLayerShellState> =
-            EventLoop::try_new().expect("Could not create event loop.");
-        let layer_shell_state = WgpuLayerShellState::new(&event_loop, layer_shell_options);
+        let event_loop = EventLoop::try_new().expect("Could not create event loop.");
+        let layer_shell_state = WgpuLayerShellState::new(event_loop.handle(), layer_shell_options);
 
         Self {
             // TODO: find better way to handle this potential error

@@ -1,4 +1,5 @@
 use layer_shell_wgpu_egui::layer_shell::LayerShellOptions;
+use smithay_client_toolkit::shell::wlr_layer::KeyboardInteractivity;
 
 fn main() -> layer_shell_wgpu_egui::Result {
     env_logger::init();
@@ -6,6 +7,7 @@ fn main() -> layer_shell_wgpu_egui::Result {
     let options = LayerShellOptions {
         width: 500,
         height: 300,
+        keyboard_interactivity: Some(KeyboardInteractivity::OnDemand),
         ..Default::default()
     };
 
