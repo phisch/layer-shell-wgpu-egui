@@ -29,7 +29,5 @@ fn main() -> layer_shell_wgpu_egui::Result {
             }
             ui.label(format!("Hello '{name}', age {age}"));
         });
-    })?;
-
-    Ok(())
+    })
 }

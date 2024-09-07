@@ -1,4 +1,4 @@
-use egui::PointerButton;
+use egui::{PointerButton, Vec2};
 use smithay_client_toolkit::{
     delegate_pointer,
     seat::pointer::{PointerEvent, PointerEventKind, PointerHandler},
@@ -40,7 +40,15 @@ impl PointerHandler for WgpuLayerShellState {
                         continue;
                     }
                 }
-                _ => continue,
+                PointerEventKind::Axis {
+                    horizontal,
+                    vertical,
+                    ..
+                } => egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: Vec2::new(-horizontal.absolute as f32, -vertical.absolute as f32),
+                    modifiers: self.egui_state.modifiers(),
+                },
             };
             self.egui_state.push_event(egui_event);
         }
